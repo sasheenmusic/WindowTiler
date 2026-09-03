@@ -48,7 +48,16 @@ final class WindowTiler {
     /// learned from what each window actually does when asked to fill a tile
     /// (no separate shrink/grow probe), dropped when the window closes, and
     /// cleared on every manual tile so a changed layout is re-measured.
-    private var learnedLimits: [String: SizeLimits] = [:]
+    private struct LearnedLimits {
+        let limits: SizeLimits
+        let learnedAt: Date
+    }
+
+    private var learnedLimits: [String: LearnedLimits] = [:]
+    /// A window's real limits can change (a toggled sidebar, a different
+    /// System Settings pane). Learned limits older than this are measured
+    /// again on the next tile, so stale values cannot stick around.
+    private let learnedLimitsLifetime: TimeInterval = 10 * 60
     /// How far short of a requested size a window lands because it snaps to
     /// a grid (Terminal resizes in whole character cells, 8x16 points with a
     /// typical font). Learned per window; a shortfall inside this allowance
@@ -120,7 +129,7 @@ final class WindowTiler {
             constrained += result.constrained
             failed += result.failed
         }
-        UserDefaults.standard.set(summaries.joined(separator: " | "), forKey: "diagnostics.lastLayout")
+        Log.tiling.debug("Layout: \(summaries.joined(separator: " | "), privacy: .public)")
         return .init(tiled: tiled, constrained: constrained, failed: failed)
     }
 
@@ -150,7 +159,7 @@ final class WindowTiler {
             guard window.sizeIsSettable else {
                 return SizeLimits(minimum: window.currentSize, maximum: window.currentSize)
             }
-            return clamp(learnedLimits[window.identity]
+            return clamp(learnedLimits[window.identity]?.limits
                 ?? SizeLimits(minimum: TilingLimits.minimumTileSize, maximum: screen.size), to: screen)
         }
         var bounded = Set(windows.indices.filter { !windows[$0].sizeIsSettable })
@@ -165,33 +174,31 @@ final class WindowTiler {
         // window really did. Windows that refuse to shrink teach us a minimum,
         // windows that refuse to grow teach us a maximum, and the layout is
         // recomputed with that knowledge until nothing new is learned.
+        var learnedOnLastPass = false
         for _ in 0..<maximumPasses {
             (layout, bounded, boundedIndices, flexibleIndices) = partition(
                 windows: windows, limits: limits, bounded: bounded, in: screen
             )
-            var requestedAny = false
-            for (position, index) in boundedIndices.enumerated()
-            where !isSettled(observed[index], in: layout.constrainedFrames[position], allowance: nil) {
-                request(frame: layout.constrainedFrames[position], for: windows[index].element)
-                requestedAny = true
-            }
-            for (position, index) in flexibleIndices.enumerated()
-            where position < layout.flexibleFrames.count
-                && !isSettled(observed[index], in: layout.flexibleFrames[position], allowance: snapAllowances[windows[index].identity]) {
-                request(frame: layout.flexibleFrames[position], for: windows[index].element)
-                requestedAny = true
-            }
-            guard requestedAny else { break }
+            let confirmed = requestUnsettled(
+                windows: windows, layout: layout, boundedIndices: boundedIndices,
+                flexibleIndices: flexibleIndices, observed: observed
+            )
+            learnedOnLastPass = false
+            guard !confirmed.isEmpty else { break }
             // One settle for the whole screen instead of a sleep per window.
             usleep(40_000)
 
-            var learnedSomething = false
             for (position, index) in flexibleIndices.enumerated() where position < layout.flexibleFrames.count {
-                let requested = layout.flexibleFrames[position].size
                 guard let actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
                 if let origin = pointAttribute(kAXPositionAttribute, from: windows[index].element) {
                     observed[index] = CGRect(origin: origin, size: actual)
                 }
+                // Learn only from a resize the app accepted. A refused or
+                // timed-out request leaves the old size in place, and reading
+                // that back as a limit is exactly the cache poisoning the
+                // audit found.
+                guard confirmed.contains(index) else { continue }
+                let requested = layout.flexibleFrames[position].size
                 // A deviation within one grid cell is snapping and must not
                 // be recorded as a limit: a 12-point shortfall in a short
                 // tile would otherwise become a hard maximum that later
@@ -205,11 +212,23 @@ final class WindowTiler {
                 updated = clamp(updated, to: screen)
                 if updated.minimum != limits[index].minimum || updated.maximum != limits[index].maximum {
                     limits[index] = updated
-                    learnedLimits[windows[index].identity] = updated
-                    learnedSomething = true
+                    learnedLimits[windows[index].identity] = LearnedLimits(limits: updated, learnedAt: Date())
+                    learnedOnLastPass = true
                 }
             }
-            if !learnedSomething { break }
+            if !learnedOnLastPass { break }
+        }
+        if learnedOnLastPass {
+            // The last pass taught us something; lay out once more so the
+            // final frames honor it.
+            (layout, bounded, boundedIndices, flexibleIndices) = partition(
+                windows: windows, limits: limits, bounded: bounded, in: screen
+            )
+            _ = requestUnsettled(
+                windows: windows, layout: layout, boundedIndices: boundedIndices,
+                flexibleIndices: flexibleIndices, observed: observed
+            )
+            usleep(40_000)
         }
 
         summaries.append(contentsOf: windows.indices.map { index in
@@ -250,6 +269,32 @@ final class WindowTiler {
             }
         }
         return .init(tiled: tiled, constrained: constrainedCount, failed: failed)
+    }
+
+    /// Asks every window that is not already in its tile to move there.
+    /// Returns the indices of flexible windows whose resize was accepted.
+    private func requestUnsettled(
+        windows: [Window],
+        layout: MosaicLayout,
+        boundedIndices: [Int],
+        flexibleIndices: [Int],
+        observed: [CGRect]
+    ) -> Set<Int> {
+        var confirmed = Set<Int>()
+        for (position, index) in boundedIndices.enumerated()
+        where !isSettled(observed[index], in: layout.constrainedFrames[position], allowance: nil)
+            && !isQuarantined(windows[index].pid) {
+            request(frame: layout.constrainedFrames[position], for: windows[index].element)
+        }
+        for (position, index) in flexibleIndices.enumerated()
+        where position < layout.flexibleFrames.count
+            && !isSettled(observed[index], in: layout.flexibleFrames[position], allowance: snapAllowances[windows[index].identity])
+            && !isQuarantined(windows[index].pid) {
+            if request(frame: layout.flexibleFrames[position], for: windows[index].element).resized {
+                confirmed.insert(index)
+            }
+        }
+        return confirmed
     }
 
     /// A window may report that it is resizable but still enforce a maximum
@@ -312,7 +357,8 @@ final class WindowTiler {
 
     private func pruneLearnedLimits(keeping identities: [String]) {
         let live = Set(identities)
-        learnedLimits = learnedLimits.filter { live.contains($0.key) }
+        let expiry = Date().addingTimeInterval(-learnedLimitsLifetime)
+        learnedLimits = learnedLimits.filter { live.contains($0.key) && $0.value.learnedAt > expiry }
         snapAllowances = snapAllowances.filter { live.contains($0.key) }
     }
 
@@ -339,8 +385,13 @@ final class WindowTiler {
         guard let positionValue = AXValueCreate(.cgPoint, &position),
               let sizeValue = AXValueCreate(.cgSize, &size) else { return (false, false) }
         let firstMove = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
+        if firstMove == .cannotComplete {
+            quarantine(element)
+            return (false, false)
+        }
         let resize = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
         let finalMove = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
+        if resize == .cannotComplete || finalMove == .cannotComplete { quarantine(element) }
         return (firstMove == .success || finalMove == .success, resize == .success)
     }
 
@@ -442,18 +493,9 @@ final class WindowTiler {
         bundleIdentifier: String?,
         onScreen: [OnScreenWindow]?
     ) -> [Window] {
-        if let blockedUntil = unresponsiveUntil[pid], blockedUntil > Date() { return [] }
+        guard !isQuarantined(pid) else { return [] }
         let app = applicationElement(for: pid)
-        var value: CFTypeRef?
-        let status = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
-        if status == .cannotComplete {
-            // The app did not answer within the messaging timeout. Leave it
-            // alone for a while instead of stalling on every request.
-            unresponsiveUntil[pid] = Date().addingTimeInterval(unresponsiveCooldown)
-            Log.tiling.warning("\(appName, privacy: .public) (pid \(pid)) did not answer within \(self.messagingTimeout) s; skipping it for \(self.unresponsiveCooldown) s")
-            return []
-        }
-        guard status == .success, let elements = value as? [AXUIElement] else { return [] }
+        guard let elements = attribute(kAXWindowsAttribute, from: app) as? [AXUIElement] else { return [] }
 
         var standard: [Window] = []
         var dialogs: [Window] = []
@@ -461,6 +503,8 @@ final class WindowTiler {
         // two identical-looking windows of one app keep distinct identities.
         var unclaimed = onScreen
         for element in elements {
+            // Stop probing an app as soon as one request has timed out.
+            guard !isQuarantined(pid) else { return [] }
             let subrole = attribute(kAXSubroleAttribute, from: element) as? String
             let isStandard = subrole == kAXStandardWindowSubrole
             let isDialog = subrole == kAXDialogSubrole
@@ -471,6 +515,9 @@ final class WindowTiler {
                   // Tiling it creates what looks like an empty desktop tile.
                   !(bundleIdentifier == "com.electron.wispr-flow" && title == "Status"),
                   (attribute(kAXMinimizedAttribute, from: element) as? Bool) != true,
+                  // A full-screen window lives on its own Space and is drawn
+                  // on screen while that Space is active; it must be left alone.
+                  (attribute("AXFullScreen", from: element) as? Bool) != true,
                   let position = pointAttribute(kAXPositionAttribute, from: element),
                   let size = sizeAttribute(kAXSizeAttribute, from: element),
                   size.width > 80, size.height > 80 else { continue }
@@ -541,8 +588,26 @@ final class WindowTiler {
 
     private func attribute(_ name: String, from element: AXUIElement) -> AnyObject? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
+        guard status == .success else {
+            if status == .cannotComplete { quarantine(element) }
+            return nil
+        }
         return value
+    }
+
+    /// Every timed-out request costs the full messaging timeout on the main
+    /// thread, so the first one is enough to leave the app alone for a while.
+    private func quarantine(_ element: AXUIElement) {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success, !isQuarantined(pid) else { return }
+        unresponsiveUntil[pid] = Date().addingTimeInterval(unresponsiveCooldown)
+        Log.tiling.warning("pid \(pid) did not answer within \(self.messagingTimeout) s; skipping it for \(self.unresponsiveCooldown) s")
+    }
+
+    private func isQuarantined(_ pid: pid_t) -> Bool {
+        guard let until = unresponsiveUntil[pid] else { return false }
+        return until > Date()
     }
 
     private func pointAttribute(_ name: String, from element: AXUIElement) -> CGPoint? {

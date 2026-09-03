@@ -125,14 +125,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let result = tiler.tileAllWindows(relearn: relearn)
         let durationMilliseconds = Int((CFAbsoluteTimeGetCurrent() - started) * 1_000)
         lastTopology = tiler.windowTopologySignature()
-        UserDefaults.standard.set([
-            "lastTileAt": Date().timeIntervalSince1970,
-            "lastTileReason": reason,
-            "lastTiledCount": result.tiled,
-            "lastConstrainedCount": result.constrained,
-            "lastFailedCount": result.failed,
-            "lastTileDurationMilliseconds": durationMilliseconds,
-        ] as [String: Any], forKey: "diagnostics.lastTile")
         Log.tiling.notice("[\(reason, privacy: .public)] tiled \(result.tiled) fixed-size \(result.constrained) failed \(result.failed) in \(durationMilliseconds) ms")
         if showFeedback && result.tiled == 0 && result.constrained == 0 {
             showAlert(title: "No windows tiled", message: "No normal app windows were available to move.")

@@ -23,7 +23,13 @@ On multi-monitor Macs, each display is tiled independently using its own usable 
 
 Wispr Flow's transparent status HUD is ignored because macOS reports it as a large window even though it has no visible content.
 
-An app that stops responding is skipped for ten seconds instead of freezing the tiler; every Accessibility request is capped at half a second.
+Every Accessibility request is capped at one second, and an app that fails to answer in time is skipped for five seconds instead of freezing the tiler. Learned size limits expire after ten minutes so a window whose limits change is measured again.
+
+Diagnostics go to the unified log:
+
+```bash
+log stream --predicate 'subsystem == "com.windowtiler.app"'
+```
 
 ## Develop
 
