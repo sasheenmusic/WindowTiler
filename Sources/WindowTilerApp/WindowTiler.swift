@@ -224,7 +224,6 @@ final class WindowTiler {
                 flexibleIndices: flexibleIndices, observed: observed
             )
             learnedOnLastPass = false
-            var needsAnotherPass = false
             guard !confirmed.isEmpty else { break }
             let before = observed
             settle()
@@ -276,7 +275,7 @@ final class WindowTiler {
                     learnedOnLastPass = true
                 }
             }
-            if !learnedOnLastPass && !needsAnotherPass { break }
+            if !learnedOnLastPass { break }
         }
         if learnedOnLastPass {
             // The last pass taught us something; lay out once more so the
