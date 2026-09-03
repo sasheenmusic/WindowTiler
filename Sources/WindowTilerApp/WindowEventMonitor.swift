@@ -9,12 +9,17 @@ final class WindowEventMonitor {
     private var workspaceTokens: [NSObjectProtocol] = []
     private let onChange: () -> Void
 
-    private static let windowNotifications: [String] = [
+    /// Registered on the application element; these fire for any window.
+    private static let applicationNotifications: [String] = [
         kAXWindowCreatedNotification,
-        kAXUIElementDestroyedNotification,
         kAXWindowMiniaturizedNotification,
         kAXWindowDeminiaturizedNotification,
         kAXWindowMovedNotification,
+    ]
+
+    /// Registered on every window element, existing and newly created.
+    private static let windowNotifications: [String] = [
+        kAXUIElementDestroyedNotification,
     ]
 
     init(onChange: @escaping () -> Void) {
@@ -66,16 +71,22 @@ final class WindowEventMonitor {
 
     private func attach(pid: pid_t) {
         var observer: AXObserver?
-        let callback: AXObserverCallback = { _, _, _, refcon in
+        let callback: AXObserverCallback = { observer, element, notification, refcon in
             guard let refcon else { return }
-            Unmanaged<WindowEventMonitor>.fromOpaque(refcon).takeUnretainedValue().onChange()
+            let monitor = Unmanaged<WindowEventMonitor>.fromOpaque(refcon).takeUnretainedValue()
+            if notification as String == kAXWindowCreatedNotification {
+                // Destruction is only reported reliably when it was requested
+                // on the window itself, so watch each new window directly.
+                monitor.watchWindow(element, with: observer)
+            }
+            monitor.onChange()
         }
         guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { return }
 
         let app = AXUIElementCreateApplication(pid)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         var registered = false
-        for name in Self.windowNotifications {
+        for name in Self.applicationNotifications {
             let status = AXObserverAddNotification(observer, app, name as CFString, refcon)
             if status == .success || status == .notificationAlreadyRegistered {
                 registered = true
@@ -86,6 +97,19 @@ final class WindowEventMonitor {
         guard registered else { return }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         observers[pid] = observer
+
+        var value: CFTypeRef?
+        if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+           let windows = value as? [AXUIElement] {
+            windows.forEach { watchWindow($0, with: observer) }
+        }
+    }
+
+    private func watchWindow(_ window: AXUIElement, with observer: AXObserver) {
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        for name in Self.windowNotifications {
+            AXObserverAddNotification(observer, window, name as CFString, refcon)
+        }
     }
 
     private func detach(_ observer: AXObserver) {

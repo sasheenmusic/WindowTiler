@@ -364,6 +364,9 @@ final class WindowTiler {
 
         var standard: [Window] = []
         var dialogs: [Window] = []
+        // Each on-screen entry may identify only one Accessibility window, so
+        // two identical-looking windows of one app keep distinct identities.
+        var unclaimed = onScreen
         for element in elements {
             let subrole = attribute(kAXSubroleAttribute, from: element) as? String
             let isStandard = subrole == kAXStandardWindowSubrole
@@ -381,8 +384,9 @@ final class WindowTiler {
 
             let frame = CGRect(origin: position, size: size)
             let identity: String
-            if let onScreen {
-                guard let match = onScreen.first(where: { matches($0.bounds, frame) }) else { continue }
+            if onScreen != nil {
+                guard let matchIndex = unclaimed?.firstIndex(where: { matches($0.bounds, frame) }),
+                      let match = unclaimed?.remove(at: matchIndex) else { continue }
                 identity = "\(pid):w\(match.number)"
             } else {
                 identity = "\(pid):h\(CFHash(element))"
