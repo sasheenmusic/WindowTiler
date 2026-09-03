@@ -174,8 +174,15 @@ final class WindowTiler {
 
     // MARK: - Tiling one screen
 
-    private func tile(windows: [Window], in screen: CGRect, summaries: inout [String]) -> TilingResult {
-        guard !windows.isEmpty else { return .empty }
+    private func tile(windows unordered: [Window], in screen: CGRect, summaries: inout [String]) -> TilingResult {
+        guard !unordered.isEmpty else { return .empty }
+        // Lay windows out in their current reading order so a re-tile keeps
+        // each window near where it already is instead of reshuffling.
+        let windows = unordered.sorted { first, second in
+            let a = (round(first.currentPosition.y / 16), round(first.currentPosition.x / 16), first.identity)
+            let b = (round(second.currentPosition.y / 16), round(second.currentPosition.x / 16), second.identity)
+            return a < b
+        }
 
         var limits = windows.map { window -> SizeLimits in
             guard window.sizeIsSettable else {
@@ -508,13 +515,17 @@ final class WindowTiler {
 
     /// Ignores window position and size so our own tiling does not trigger a
     /// loop, but changes when a visible window opens, closes, or minimizes.
+    /// Counts windows per app per screen rather than tracking window ids:
+    /// native window tabs (Terminal, Finder, TextEdit) are separate windows,
+    /// and switching tabs swaps which one is on screen. That must not look
+    /// like a window closing and another opening.
     /// Nil when the visible-window list is unavailable, so the caller can
     /// treat the state as unknown instead of as a change.
     func windowTopologySignature() -> String? {
         let screens = screenBoundsInAccessibilityCoordinates()
         guard let windows = eligibleWindows() else { return nil }
         let signature = ScreenGeometryEngine.topologySignature(
-            windowCenters: windows.map { ($0.identity, $0.center) },
+            windowCenters: windows.map { ("\($0.pid)", $0.center) },
             screens: screens
         )
         // While an app is not answering, its windows cannot be listed, so

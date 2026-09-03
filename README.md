@@ -13,7 +13,7 @@ On first launch, allow **Window Tiler** in **System Settings → Privacy & Secur
 
 Press **Control–Option–Command–T** to tile your windows. Click the grid icon in the menu bar to tile manually, choose another shortcut, or turn automatic re-tiling on and off.
 
-Automatic re-tiling is on by default. Window Tiler listens for window events instead of polling, so when a normal window opens, closes, minimizes, or returns, the visible windows reflow about a quarter of a second after the change settles. Minimized windows, hidden apps, and windows on other Spaces stay out of the way until you bring them back.
+Automatic re-tiling is on by default. Switching between native window tabs (Terminal, Finder, TextEdit) does not count as a change, and a re-tile keeps windows in their current reading order. Window Tiler listens for window events instead of polling, so when a normal window opens, closes, minimizes, or returns, the visible windows reflow about a quarter of a second after the change settles. Minimized windows, hidden apps, and windows on other Spaces stay out of the way until you bring them back.
 
 Windows stay on their current display and are tiled within that display's usable area, avoiding the menu bar and Dock. Every visible window receives an approximately equal share of the display. Open and Save panels and modal dialogs are never tiled, and a non-modal window reported as a dialog counts only when the app has no standard window at all. Temporary system popups, tiny helper panels, and floating palettes are left alone.
 
