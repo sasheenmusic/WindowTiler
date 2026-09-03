@@ -48,9 +48,15 @@ final class WindowTiler {
     /// learned from what each window actually does when asked to fill a tile
     /// (no separate shrink/grow probe), dropped when the window closes, and
     /// cleared on every manual tile so a changed layout is re-measured.
+    /// Only what was actually observed. An axis never seen to be limited
+    /// stays at its sentinel (0 for a minimum, infinity for a maximum) so a
+    /// default copied from one screen never becomes a "limit" on another.
     private struct LearnedLimits {
-        let limits: SizeLimits
-        let learnedAt: Date
+        var minimum = CGSize.zero
+        var maximum = CGSize(width: CGFloat.infinity, height: CGFloat.infinity)
+        var learnedAt = Date()
+
+        var isEmpty: Bool { minimum == .zero && maximum.width == .infinity && maximum.height == .infinity }
     }
 
     private var learnedLimits: [String: LearnedLimits] = [:]
@@ -159,8 +165,7 @@ final class WindowTiler {
             guard window.sizeIsSettable else {
                 return SizeLimits(minimum: window.currentSize, maximum: window.currentSize)
             }
-            return clamp(learnedLimits[window.identity]?.limits
-                ?? SizeLimits(minimum: TilingLimits.minimumTileSize, maximum: screen.size), to: screen)
+            return effectiveLimits(learnedLimits[window.identity] ?? LearnedLimits(), on: screen)
         }
         var bounded = Set(windows.indices.filter { !windows[$0].sizeIsSettable })
         var boundedIndices: [Int] = []
@@ -185,10 +190,10 @@ final class WindowTiler {
             )
             learnedOnLastPass = false
             guard !confirmed.isEmpty else { break }
-            // One settle for the whole screen instead of a sleep per window.
-            usleep(40_000)
+            settle()
 
-            for (position, index) in flexibleIndices.enumerated() where position < layout.flexibleFrames.count {
+            for (position, index) in flexibleIndices.enumerated()
+            where position < layout.flexibleFrames.count && !isQuarantined(windows[index].pid) {
                 guard let actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
                 if let origin = pointAttribute(kAXPositionAttribute, from: windows[index].element) {
                     observed[index] = CGRect(origin: origin, size: actual)
@@ -204,15 +209,16 @@ final class WindowTiler {
                 // tile would otherwise become a hard maximum that later
                 // turns the window into a fixed-size block.
                 learnSnap(identity: windows[index].identity, requested: requested, actual: actual)
-                var updated = limits[index]
-                if actual.width > requested.width + boundedTolerance { updated.minimum.width = max(updated.minimum.width, actual.width) }
-                if actual.height > requested.height + boundedTolerance { updated.minimum.height = max(updated.minimum.height, actual.height) }
-                if actual.width < requested.width - boundedTolerance { updated.maximum.width = min(updated.maximum.width, actual.width) }
-                if actual.height < requested.height - boundedTolerance { updated.maximum.height = min(updated.maximum.height, actual.height) }
-                updated = clamp(updated, to: screen)
-                if updated.minimum != limits[index].minimum || updated.maximum != limits[index].maximum {
-                    limits[index] = updated
-                    learnedLimits[windows[index].identity] = LearnedLimits(limits: updated, learnedAt: Date())
+                let previous = learnedLimits[windows[index].identity] ?? LearnedLimits()
+                var learned = previous
+                if actual.width > requested.width + boundedTolerance { learned.minimum.width = max(learned.minimum.width, actual.width) }
+                if actual.height > requested.height + boundedTolerance { learned.minimum.height = max(learned.minimum.height, actual.height) }
+                if actual.width < requested.width - boundedTolerance { learned.maximum.width = min(learned.maximum.width, actual.width) }
+                if actual.height < requested.height - boundedTolerance { learned.maximum.height = min(learned.maximum.height, actual.height) }
+                if learned.minimum != previous.minimum || learned.maximum != previous.maximum {
+                    learned.learnedAt = Date()
+                    learnedLimits[windows[index].identity] = learned
+                    limits[index] = effectiveLimits(learned, on: screen)
                     learnedOnLastPass = true
                 }
             }
@@ -228,7 +234,7 @@ final class WindowTiler {
                 windows: windows, layout: layout, boundedIndices: boundedIndices,
                 flexibleIndices: flexibleIndices, observed: observed
             )
-            usleep(40_000)
+            settle()
         }
 
         summaries.append(contentsOf: windows.indices.map { index in
@@ -243,7 +249,9 @@ final class WindowTiler {
         var constrainedCount = 0
         var failed = 0
         for (position, index) in boundedIndices.enumerated() {
-            if isSettled(observed[index], in: layout.constrainedFrames[position], allowance: nil)
+            if isQuarantined(windows[index].pid) {
+                failed += 1
+            } else if isSettled(observed[index], in: layout.constrainedFrames[position], allowance: nil)
                 || applyBounded(frame: layout.constrainedFrames[position], to: windows[index].element) {
                 constrainedCount += 1
             } else {
@@ -258,6 +266,10 @@ final class WindowTiler {
                 continue
             }
             let allowance = snapAllowances[windows[index].identity]
+            if isQuarantined(windows[index].pid) {
+                failed += 1
+                continue
+            }
             if isSettled(observed[index], in: layout.flexibleFrames[position], allowance: allowance) {
                 tiled += 1
                 continue
@@ -333,6 +345,13 @@ final class WindowTiler {
         return (layout, bounded, boundedIndices, flexibleIndices)
     }
 
+    /// Gives the apps a moment to apply their new frames. Runs the main run
+    /// loop instead of sleeping so the menu and hotkey stay responsive; the
+    /// delegate's isTiling flag keeps a nested tile from starting meanwhile.
+    private func settle() {
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.04))
+    }
+
     /// True when a window sits at its tile's origin and within its size
     /// wiggle room, so no request is needed.
     private func isSettled(_ observed: CGRect, in frame: CGRect, allowance: CGSize?) -> Bool {
@@ -343,14 +362,15 @@ final class WindowTiler {
             && abs(observed.height - frame.height) <= max(wiggle.height, sizeTolerance)
     }
 
-    private func clamp(_ limits: SizeLimits, to screen: CGRect) -> SizeLimits {
+    /// Learned limits combined with this screen's bounds.
+    private func effectiveLimits(_ learned: LearnedLimits, on screen: CGRect) -> SizeLimits {
         let minimum = CGSize(
-            width: min(max(TilingLimits.minimumTileSize.width, limits.minimum.width), screen.width),
-            height: min(max(TilingLimits.minimumTileSize.height, limits.minimum.height), screen.height)
+            width: min(max(TilingLimits.minimumTileSize.width, learned.minimum.width), screen.width),
+            height: min(max(TilingLimits.minimumTileSize.height, learned.minimum.height), screen.height)
         )
         let maximum = CGSize(
-            width: max(minimum.width, min(screen.width, limits.maximum.width)),
-            height: max(minimum.height, min(screen.height, limits.maximum.height))
+            width: max(minimum.width, min(screen.width, learned.maximum.width)),
+            height: max(minimum.height, min(screen.height, learned.maximum.height))
         )
         return SizeLimits(minimum: minimum, maximum: maximum)
     }
@@ -390,14 +410,18 @@ final class WindowTiler {
             return (false, false)
         }
         let resize = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
+        if resize == .cannotComplete {
+            quarantine(element)
+            return (firstMove == .success, false)
+        }
         let finalMove = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
-        if resize == .cannotComplete || finalMove == .cannotComplete { quarantine(element) }
+        if finalMove == .cannotComplete { quarantine(element) }
         return (firstMove == .success || finalMove == .success, resize == .success)
     }
 
     private func finish(frame: CGRect, for element: AXUIElement, snapAllowance: CGSize?) -> ApplyResult {
         let outcome = request(frame: frame, for: element)
-        guard outcome.moved else { return .failed }
+        guard outcome.moved, !isQuarantined(element) else { return .failed }
         guard outcome.resized, let actual = sizeAttribute(kAXSizeAttribute, from: element) else {
             return centerConstrainedWindow(element, in: frame)
         }
@@ -499,6 +523,7 @@ final class WindowTiler {
 
         var standard: [Window] = []
         var dialogs: [Window] = []
+        var hasStandardWindow = false
         // Each on-screen entry may identify only one Accessibility window, so
         // two identical-looking windows of one app keep distinct identities.
         var unclaimed = onScreen
@@ -509,6 +534,9 @@ final class WindowTiler {
             let isStandard = subrole == kAXStandardWindowSubrole
             let isDialog = subrole == kAXDialogSubrole
             guard isStandard || isDialog else { continue }
+            if isStandard { hasStandardWindow = true }
+            // Open and Save panels and other modal dialogs are never tiled.
+            if isDialog, (attribute(kAXModalAttribute, from: element) as? Bool) == true { continue }
             let title = attribute(kAXTitleAttribute, from: element) as? String
             guard (attribute(kAXRoleAttribute, from: element) as? String) == kAXWindowRole,
                   // Wispr exposes a large transparent status HUD as a window.
@@ -548,10 +576,10 @@ final class WindowTiler {
             )
             if isStandard { standard.append(window) } else { dialogs.append(window) }
         }
-        // Dialogs count only when they are the app's main window. Open and
-        // Save panels of an app that already has a normal window would
-        // otherwise reflow the whole desktop twice.
-        return standard.isEmpty ? dialogs : standard
+        // A non-modal dialog counts only when it is the app's main window,
+        // that is, when the app has no standard window at all (minimized
+        // ones included).
+        return hasStandardWindow ? standard : dialogs
     }
 
     private func matches(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
@@ -603,6 +631,11 @@ final class WindowTiler {
         guard AXUIElementGetPid(element, &pid) == .success, !isQuarantined(pid) else { return }
         unresponsiveUntil[pid] = Date().addingTimeInterval(unresponsiveCooldown)
         Log.tiling.warning("pid \(pid) did not answer within \(self.messagingTimeout) s; skipping it for \(self.unresponsiveCooldown) s")
+    }
+
+    private func isQuarantined(_ element: AXUIElement) -> Bool {
+        var pid: pid_t = 0
+        return AXUIElementGetPid(element, &pid) == .success && isQuarantined(pid)
     }
 
     private func isQuarantined(_ pid: pid_t) -> Bool {
