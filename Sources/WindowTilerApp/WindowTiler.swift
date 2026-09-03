@@ -80,11 +80,13 @@ final class WindowTiler {
     /// the request reduced by the overshoot (grid-rounding apps round to
     /// the nearest cell, so a smaller request lands inside the tile).
     private var shrinkRetries: [String: CGSize] = [:]
-    /// Unchanged sizes seen once after a request during the current tile,
-    /// by window identity. A clamp is only believed once a second, separate
-    /// attempt in the same tile shows the same unchanged size; the record
-    /// is consumed by that confirmation and never outlives the tile.
-    private var pendingClamps: [String: CGSize] = [:]
+    /// Unchanged sizes seen once after an accepted request, by window
+    /// identity. A clamp is only believed when a later, separate tile shows
+    /// the same unchanged size: two reads 40 ms apart inside one tile are
+    /// not independent for a busy app (Terminal rendering heavy output kept
+    /// its old size through both and was wrongly given a hard minimum).
+    /// Consumed by the confirmation, pruned with the other caches.
+    private var pendingClamps: [String: (size: CGSize, seenAt: Date)] = [:]
     private let systemWideElement = AXUIElementCreateSystemWide()
     private let enhancedUserInterfaceAttribute = "AXEnhancedUserInterface"
 
@@ -117,8 +119,8 @@ final class WindowTiler {
         if relearn {
             learnedLimits.removeAll()
             snapAllowances.removeAll()
+            pendingClamps.removeAll()
         }
-        pendingClamps.removeAll()
         shrinkRetries.removeAll()
 
         let screens = screenBoundsInAccessibilityCoordinates()
@@ -190,6 +192,7 @@ final class WindowTiler {
 
     private func tile(windows unordered: [Window], in screen: CGRect, summaries: inout [String]) -> TilingResult {
         guard !unordered.isEmpty else { return .empty }
+        let tileStartedAt = Date()
         // Lay windows out in their current reading order so a re-tile keeps
         // each window near where it already is instead of reshuffling.
         let windows = unordered.sorted { first, second in
@@ -249,12 +252,14 @@ final class WindowTiler {
                 // busy or still-opening window never teaches a limit.
                 let identity = windows[index].identity
                 if actual == before[index].size, actual != requested {
-                    if pendingClamps[identity] != actual {
-                        pendingClamps[identity] = actual
-                        needsAnotherPass = true
+                    if let pending = pendingClamps[identity], pending.size == actual, pending.seenAt < tileStartedAt {
+                        pendingClamps[identity] = nil
+                    } else {
+                        if pendingClamps[identity]?.size != actual {
+                            pendingClamps[identity] = (actual, Date())
+                        }
                         continue
                     }
-                    pendingClamps[identity] = nil
                 } else {
                     pendingClamps[identity] = nil
                 }
@@ -459,6 +464,7 @@ final class WindowTiler {
         let expiry = Date().addingTimeInterval(-learnedLimitsLifetime)
         learnedLimits = learnedLimits.filter { live.contains($0.key) && $0.value.learnedAt > expiry }
         snapAllowances = snapAllowances.filter { live.contains($0.key) }
+        pendingClamps = pendingClamps.filter { live.contains($0.key) && $0.value.seenAt > expiry }
     }
 
     /// A shortfall of at most one grid cell is snapping (Terminal rounds to
