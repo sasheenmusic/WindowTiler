@@ -76,10 +76,6 @@ final class WindowTiler {
     /// switch back yet (they were quarantined mid-tile). Retried each tile.
     private var pendingEnhancedUIRestore = Set<pid_t>()
     private var restoreRetryScheduled = false
-    /// Per-tile: windows that overshot their tile once and are retried with
-    /// the request reduced by the overshoot (grid-rounding apps round to
-    /// the nearest cell, so a smaller request lands inside the tile).
-    private var shrinkRetries: [String: CGSize] = [:]
     /// Unchanged sizes seen once after an accepted request, by window
     /// identity. A clamp is only believed when a later, separate tile shows
     /// the same unchanged size: two reads 40 ms apart inside one tile are
@@ -121,7 +117,6 @@ final class WindowTiler {
             snapAllowances.removeAll()
             pendingClamps.removeAll()
         }
-        shrinkRetries.removeAll()
 
         let screens = screenBoundsInAccessibilityCoordinates()
         guard !screens.isEmpty else { return .empty }
@@ -268,21 +263,10 @@ final class WindowTiler {
                 // tile would otherwise become a hard maximum that later
                 // turns the window into a fixed-size block.
                 learnSnap(identity: windows[index].identity, requested: requested, actual: actual)
-                // An overshoot of up to one cell gets one retry with the
-                // request reduced by the overshoot; if the window still
-                // overshoots, that size is its real minimum.
-                let overshoot = CGSize(width: actual.width - requested.width, height: actual.height - requested.height)
-                if (overshoot.width > sizeTolerance || overshoot.height > sizeTolerance),
-                   overshoot.width <= boundedTolerance, overshoot.height <= boundedTolerance,
-                   shrinkRetries[identity] == nil {
-                    shrinkRetries[identity] = CGSize(width: max(0, overshoot.width), height: max(0, overshoot.height))
-                    needsAnotherPass = true
-                    continue
-                }
                 let previous = learnedLimits[windows[index].identity] ?? LearnedLimits()
                 var learned = previous
-                if actual.width > requested.width + sizeTolerance { learned.minimum.width = max(learned.minimum.width, actual.width) }
-                if actual.height > requested.height + sizeTolerance { learned.minimum.height = max(learned.minimum.height, actual.height) }
+                if actual.width > requested.width + boundedTolerance { learned.minimum.width = max(learned.minimum.width, actual.width) }
+                if actual.height > requested.height + boundedTolerance { learned.minimum.height = max(learned.minimum.height, actual.height) }
                 if actual.width < requested.width - boundedTolerance { learned.maximum.width = min(learned.maximum.width, actual.width) }
                 if actual.height < requested.height - boundedTolerance { learned.maximum.height = min(learned.maximum.height, actual.height) }
                 if learned.minimum != previous.minimum || learned.maximum != previous.maximum {
@@ -344,14 +328,7 @@ final class WindowTiler {
                 tiled += 1
                 continue
             }
-            // A window that overshot gets the reduced request here too, so
-            // it ends inside its tile once the app catches up.
-            var frame = layout.flexibleFrames[position]
-            if let shrink = shrinkRetries[windows[index].identity] {
-                frame.size.width -= shrink.width
-                frame.size.height -= shrink.height
-            }
-            switch finish(frame: layout.flexibleFrames[position], requesting: frame, for: windows[index].element, snapAllowance: allowance) {
+            switch finish(frame: layout.flexibleFrames[position], for: windows[index].element, snapAllowance: allowance) {
             case .tiled: tiled += 1
             case .constrained: constrainedCount += 1
             case .failed: failed += 1
@@ -379,12 +356,7 @@ final class WindowTiler {
         where position < layout.flexibleFrames.count
             && !isSettled(observed[index], in: layout.flexibleFrames[position], allowance: snapAllowances[windows[index].identity])
             && !isQuarantined(windows[index].pid) {
-            var frame = layout.flexibleFrames[position]
-            if let shrink = shrinkRetries[windows[index].identity] {
-                frame.size.width -= shrink.width
-                frame.size.height -= shrink.height
-            }
-            if request(frame: frame, for: windows[index].element).resized {
+            if request(frame: layout.flexibleFrames[position], for: windows[index].element).resized {
                 confirmed.insert(index)
             }
         }
@@ -445,10 +417,8 @@ final class WindowTiler {
         let wiggle = allowance ?? .zero
         return abs(observed.minX - frame.minX) <= sizeTolerance
             && abs(observed.minY - frame.minY) <= sizeTolerance
-            && observed.width <= frame.width + sizeTolerance
-            && observed.height <= frame.height + sizeTolerance
-            && frame.width - observed.width <= max(wiggle.width, sizeTolerance)
-            && frame.height - observed.height <= max(wiggle.height, sizeTolerance)
+            && abs(observed.width - frame.width) <= max(wiggle.width, sizeTolerance)
+            && abs(observed.height - frame.height) <= max(wiggle.height, sizeTolerance)
     }
 
     /// Learned limits combined with this screen's bounds.
@@ -474,17 +444,16 @@ final class WindowTiler {
         pendingClamps = pendingClamps.filter { live.contains($0.key) && $0.value.seenAt > expiry }
     }
 
-    /// A shortfall of at most one grid cell is snapping (Terminal rounds to
-    /// whole cells). Remember the largest seen on each axis; that is this
-    /// window's wiggle room. Only undersizing is wiggle room: an oversize
-    /// window would overlap its neighbor, so it is retried or learned as a
-    /// minimum instead.
+    /// A deviation of at most one grid cell in either direction is snapping
+    /// (Terminal rounds to the nearest whole cell, so it can land up to half
+    /// a cell over as well as under). Remember the largest seen on each
+    /// axis; that is this window's wiggle room.
     private func learnSnap(identity: String, requested: CGSize, actual: CGSize) {
-        let shortWidth = requested.width - actual.width
-        let shortHeight = requested.height - actual.height
+        let widthGap = abs(requested.width - actual.width)
+        let heightGap = abs(requested.height - actual.height)
         var allowance = snapAllowances[identity] ?? .zero
-        if shortWidth > sizeTolerance, shortWidth <= boundedTolerance { allowance.width = max(allowance.width, shortWidth) }
-        if shortHeight > sizeTolerance, shortHeight <= boundedTolerance { allowance.height = max(allowance.height, shortHeight) }
+        if widthGap > sizeTolerance, widthGap <= boundedTolerance { allowance.width = max(allowance.width, widthGap) }
+        if heightGap > sizeTolerance, heightGap <= boundedTolerance { allowance.height = max(allowance.height, heightGap) }
         if allowance != .zero { snapAllowances[identity] = allowance }
     }
 
@@ -514,27 +483,21 @@ final class WindowTiler {
         return (firstMove == .success || finalMove == .success, resize == .success)
     }
 
-    /// - Parameters:
-    ///   - frame: the tile the window should occupy.
-    ///   - requested: what to ask for, possibly a little smaller than the
-    ///     tile for a window that rounds its size up.
-    private func finish(frame: CGRect, requesting requested: CGRect, for element: AXUIElement, snapAllowance: CGSize?) -> ApplyResult {
-        let outcome = request(frame: requested, for: element)
+    private func finish(frame: CGRect, for element: AXUIElement, snapAllowance: CGSize?) -> ApplyResult {
+        let outcome = request(frame: frame, for: element)
         guard outcome.moved, !isQuarantined(element) else { return .failed }
         guard outcome.resized, let actual = sizeAttribute(kAXSizeAttribute, from: element) else {
             return centerConstrainedWindow(element, in: frame)
         }
-        let shortWidth = frame.width - actual.width
-        let shortHeight = frame.height - actual.height
-        if abs(shortWidth) <= sizeTolerance && abs(shortHeight) <= sizeTolerance { return .tiled }
-        // A grid-snapped window lands a little short of its tile. Leave it
+        let widthGap = abs(actual.width - frame.width)
+        let heightGap = abs(actual.height - frame.height)
+        if widthGap <= sizeTolerance && heightGap <= sizeTolerance { return .tiled }
+        // A grid-snapped window lands within one cell of its tile. Leave it
         // at the tile's top-left corner, where it already is, so it does not
         // jump on every re-tile; the wiggle room stays at the bottom/right.
-        // An oversize window is never "snapped": it would overlap.
         let allowance = snapAllowance ?? CGSize(width: boundedTolerance, height: boundedTolerance)
-        let snapped = shortWidth >= -sizeTolerance && shortHeight >= -sizeTolerance
-            && shortWidth <= max(allowance.width, sizeTolerance)
-            && shortHeight <= max(allowance.height, sizeTolerance)
+        let snapped = widthGap <= max(allowance.width, sizeTolerance)
+            && heightGap <= max(allowance.height, sizeTolerance)
         return snapped ? .tiled : centerConstrainedWindow(element, in: frame)
     }
 
