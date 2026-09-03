@@ -6,15 +6,15 @@ struct TilingResult {
     let tiled: Int
     let constrained: Int
     let failed: Int
+
+    static let empty = TilingResult(tiled: 0, constrained: 0, failed: 0)
 }
 
 final class WindowTiler {
     private struct SizeLimits {
-        let minimum: CGSize
-        let maximum: CGSize
+        var minimum: CGSize
+        var maximum: CGSize
     }
-
-    private var sizeLimitsCache: [String: SizeLimits] = [:]
 
     private enum ApplyResult {
         case tiled
@@ -32,19 +32,57 @@ final class WindowTiler {
         let sizeIsSettable: Bool
     }
 
+    private struct OnScreenWindow {
+        let number: Int
+        let bounds: CGRect
+    }
+
+    /// Size limits observed while tiling, keyed by window identity. They are
+    /// learned from what each window actually does when asked to fill a tile
+    /// (no separate shrink/grow probe), dropped when the window closes, and
+    /// cleared on every manual tile so a changed layout is re-measured.
+    private var learnedLimits: [String: SizeLimits] = [:]
+    private var applicationElements: [pid_t: AXUIElement] = [:]
+    private var unresponsiveUntil: [pid_t: Date] = [:]
+    private let systemWideElement = AXUIElementCreateSystemWide()
+
+    /// Seconds to wait for another app before giving up on an Accessibility
+    /// request. The default is six seconds per request, which lets one hung
+    /// app freeze the tiler.
+    private let messagingTimeout: Float = 0.5
+    private let unresponsiveCooldown: TimeInterval = 10
+    private let maximumPasses = 4
+    private let sizeTolerance: CGFloat = 2
+    /// Terminal and some AppKit windows snap to a character/pixel grid and may
+    /// stop a few points short of the requested size. That is not a genuinely
+    /// fixed-size window and must not send the whole desktop into the
+    /// bounded-window mosaic fallback.
+    private let boundedTolerance: CGFloat = 32
+
+    init() {
+        AXUIElementSetMessagingTimeout(systemWideElement, messagingTimeout)
+    }
+
     func isAccessibilityEnabled(prompt: Bool) -> Bool {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
     }
 
-    func tileAllWindows() -> TilingResult {
-        guard isAccessibilityEnabled(prompt: true) else { return .init(tiled: 0, constrained: 0, failed: 0) }
+    /// - Parameter relearn: forget every learned size limit first. Manual
+    ///   tiles use this so a window whose limits changed (a toggled sidebar,
+    ///   a new font size) is measured again.
+    func tileAllWindows(relearn: Bool) -> TilingResult {
+        guard isAccessibilityEnabled(prompt: false) else { return .empty }
+        if relearn { learnedLimits.removeAll() }
 
         let screens = screenBoundsInAccessibilityCoordinates()
-        guard !screens.isEmpty else { return .init(tiled: 0, constrained: 0, failed: 0) }
+        guard !screens.isEmpty else { return .empty }
+
+        let windows = eligibleWindows()
+        pruneLearnedLimits(keeping: windows.map(\.identity))
 
         var grouped = Array(repeating: [Window](), count: screens.count)
-        for window in eligibleWindows() {
+        for window in windows {
             guard let screenIndex = ScreenGeometryEngine.screenIndex(
                 for: window.center,
                 screens: screens
@@ -55,64 +93,80 @@ final class WindowTiler {
         var tiled = 0
         var constrained = 0
         var failed = 0
+        var summaries: [String] = []
         for index in screens.indices {
-            let windows = grouped[index]
-            let result = tile(windows: windows, in: screens[index])
+            let result = tile(windows: grouped[index], in: screens[index], summaries: &summaries)
             tiled += result.tiled
             constrained += result.constrained
             failed += result.failed
         }
+        UserDefaults.standard.set(summaries.joined(separator: " | "), forKey: "diagnostics.lastLayout")
         return .init(tiled: tiled, constrained: constrained, failed: failed)
     }
 
-    private func tile(windows: [Window], in screen: CGRect) -> TilingResult {
-        let limits = windows.map { sizeLimits(for: $0, on: screen) }
-        var constrained = Set(windows.indices.filter { !windows[$0].sizeIsSettable })
-        var constrainedIndices: [Int] = []
+    // MARK: - Tiling one screen
+
+    private func tile(windows: [Window], in screen: CGRect, summaries: inout [String]) -> TilingResult {
+        guard !windows.isEmpty else { return .empty }
+
+        var limits = windows.map { window -> SizeLimits in
+            guard window.sizeIsSettable else {
+                return SizeLimits(minimum: window.currentSize, maximum: window.currentSize)
+            }
+            return clamp(learnedLimits[window.identity]
+                ?? SizeLimits(minimum: TilingLimits.minimumTileSize, maximum: screen.size), to: screen)
+        }
+        var bounded = Set(windows.indices.filter { !windows[$0].sizeIsSettable })
+        var boundedIndices: [Int] = []
         var flexibleIndices: [Int] = []
         var layout = MosaicLayout(constrainedFrames: [], flexibleFrames: [])
 
-        // A window may report that it is resizable but still enforce a maximum
-        // size (System Settings does this). Repartition until every flexible
-        // tile is inside the window's real min/max range.
-        for _ in 0...windows.count {
-            constrainedIndices = windows.indices.filter { constrained.contains($0) }
-            flexibleIndices = windows.indices.filter { !constrained.contains($0) }
-            layout = MosaicLayoutEngine.frames(
-                constrainedSizes: constrainedIndices.map {
-                    windows[$0].sizeIsSettable ? limits[$0].maximum : windows[$0].currentSize
-                },
-                flexibleMinimumSizes: flexibleIndices.map { limits[$0].minimum },
-                in: screen
+        // Each pass asks every window for its tile, then reads back what the
+        // window really did. Windows that refuse to shrink teach us a minimum,
+        // windows that refuse to grow teach us a maximum, and the layout is
+        // recomputed with that knowledge until nothing new is learned.
+        for _ in 0..<maximumPasses {
+            (layout, bounded, boundedIndices, flexibleIndices) = partition(
+                windows: windows, limits: limits, bounded: bounded, in: screen
             )
-
-            let newlyConstrained = flexibleIndices.enumerated().compactMap { position, index -> Int? in
-                guard position < layout.flexibleFrames.count else { return index }
-                let frame = layout.flexibleFrames[position]
-                // Terminal and some AppKit windows snap to a character/pixel
-                // grid and may stop a few points short of the requested size.
-                // That is not a genuinely fixed-size window and must not send
-                // the entire desktop into the bounded-window mosaic fallback.
-                let maximumTolerance: CGFloat = 32
-                return frame.width > limits[index].maximum.width + maximumTolerance
-                    || frame.height > limits[index].maximum.height + maximumTolerance ? index : nil
+            for (position, index) in boundedIndices.enumerated() {
+                request(frame: layout.constrainedFrames[position], for: windows[index].element)
             }
-            if newlyConstrained.isEmpty { break }
-            constrained.formUnion(newlyConstrained)
+            for (position, index) in flexibleIndices.enumerated() where position < layout.flexibleFrames.count {
+                request(frame: layout.flexibleFrames[position], for: windows[index].element)
+            }
+            // One settle for the whole screen instead of a sleep per window.
+            usleep(40_000)
+
+            var learnedSomething = false
+            for (position, index) in flexibleIndices.enumerated() where position < layout.flexibleFrames.count {
+                let requested = layout.flexibleFrames[position].size
+                guard let actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
+                var updated = limits[index]
+                if actual.width > requested.width + sizeTolerance { updated.minimum.width = max(updated.minimum.width, actual.width) }
+                if actual.height > requested.height + sizeTolerance { updated.minimum.height = max(updated.minimum.height, actual.height) }
+                if actual.width < requested.width - sizeTolerance { updated.maximum.width = min(updated.maximum.width, actual.width) }
+                if actual.height < requested.height - sizeTolerance { updated.maximum.height = min(updated.maximum.height, actual.height) }
+                updated = clamp(updated, to: screen)
+                if updated.minimum != limits[index].minimum || updated.maximum != limits[index].maximum {
+                    limits[index] = updated
+                    learnedLimits[windows[index].identity] = updated
+                    learnedSomething = true
+                }
+            }
+            if !learnedSomething { break }
         }
 
-        let summary = windows.indices.map { index in
-            let state = constrained.contains(index) ? "bounded" : "flexible"
+        summaries.append(contentsOf: windows.indices.map { index in
+            let state = bounded.contains(index) ? "bounded" : "flexible"
             return "\(windows[index].name): min \(Int(limits[index].minimum.width))x\(Int(limits[index].minimum.height)), max \(Int(limits[index].maximum.width))x\(Int(limits[index].maximum.height)), \(state)"
-        }.joined(separator: " | ")
-        UserDefaults.standard.set(summary, forKey: "diagnostics.lastLayout")
+        })
 
         var tiled = 0
         var constrainedCount = 0
         var failed = 0
-
-        for (position, index) in constrainedIndices.enumerated() {
-            if applyConstrained(frame: layout.constrainedFrames[position], to: windows[index].element) {
+        for (position, index) in boundedIndices.enumerated() {
+            if applyBounded(frame: layout.constrainedFrames[position], to: windows[index].element) {
                 constrainedCount += 1
             } else {
                 failed += 1
@@ -125,7 +179,7 @@ final class WindowTiler {
                 failed += 1
                 continue
             }
-            switch apply(frame: layout.flexibleFrames[position], to: windows[index].element) {
+            switch finish(frame: layout.flexibleFrames[position], for: windows[index].element) {
             case .tiled: tiled += 1
             case .constrained: constrainedCount += 1
             case .failed: failed += 1
@@ -134,61 +188,114 @@ final class WindowTiler {
         return .init(tiled: tiled, constrained: constrainedCount, failed: failed)
     }
 
-    private func applyConstrained(frame: CGRect, to element: AXUIElement) -> Bool {
+    /// A window may report that it is resizable but still enforce a maximum
+    /// size (System Settings does this). Repartition until every flexible
+    /// tile is inside the window's known min/max range.
+    private func partition(
+        windows: [Window],
+        limits: [SizeLimits],
+        bounded initialBounded: Set<Int>,
+        in screen: CGRect
+    ) -> (MosaicLayout, Set<Int>, [Int], [Int]) {
+        var bounded = initialBounded
+        var boundedIndices: [Int] = []
+        var flexibleIndices: [Int] = []
+        var layout = MosaicLayout(constrainedFrames: [], flexibleFrames: [])
+
+        for _ in 0...windows.count {
+            boundedIndices = windows.indices.filter { bounded.contains($0) }
+            flexibleIndices = windows.indices.filter { !bounded.contains($0) }
+            layout = MosaicLayoutEngine.frames(
+                constrainedSizes: boundedIndices.map {
+                    windows[$0].sizeIsSettable ? limits[$0].maximum : windows[$0].currentSize
+                },
+                flexibleMinimumSizes: flexibleIndices.map { limits[$0].minimum },
+                in: screen
+            )
+            let newlyBounded = flexibleIndices.enumerated().compactMap { position, index -> Int? in
+                guard position < layout.flexibleFrames.count else { return index }
+                let frame = layout.flexibleFrames[position]
+                return frame.width > limits[index].maximum.width + boundedTolerance
+                    || frame.height > limits[index].maximum.height + boundedTolerance ? index : nil
+            }
+            if newlyBounded.isEmpty { break }
+            bounded.formUnion(newlyBounded)
+        }
+        return (layout, bounded, boundedIndices, flexibleIndices)
+    }
+
+    private func clamp(_ limits: SizeLimits, to screen: CGRect) -> SizeLimits {
+        let minimum = CGSize(
+            width: min(max(TilingLimits.minimumTileSize.width, limits.minimum.width), screen.width),
+            height: min(max(TilingLimits.minimumTileSize.height, limits.minimum.height), screen.height)
+        )
+        let maximum = CGSize(
+            width: max(minimum.width, min(screen.width, limits.maximum.width)),
+            height: max(minimum.height, min(screen.height, limits.maximum.height))
+        )
+        return SizeLimits(minimum: minimum, maximum: maximum)
+    }
+
+    private func pruneLearnedLimits(keeping identities: [String]) {
+        let live = Set(identities)
+        learnedLimits = learnedLimits.filter { live.contains($0.key) }
+    }
+
+    // MARK: - Applying frames
+
+    /// Moving before and after resizing handles apps that constrain their
+    /// size at screen edges.
+    @discardableResult
+    private func request(frame: CGRect, for element: AXUIElement) -> (moved: Bool, resized: Bool) {
         var position = frame.origin
         var size = frame.size
         guard let positionValue = AXValueCreate(.cgPoint, &position),
-              let sizeValue = AXValueCreate(.cgSize, &size) else { return false }
-        let sizeResult = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
-        let moveResult = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
-        return moveResult == .success && (sizeResult == .success || !isAttributeSettable(kAXSizeAttribute, on: element))
+              let sizeValue = AXValueCreate(.cgSize, &size) else { return (false, false) }
+        let firstMove = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
+        let resize = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
+        let finalMove = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
+        return (firstMove == .success || finalMove == .success, resize == .success)
     }
 
-    private func sizeLimits(for window: Window, on screen: CGRect) -> SizeLimits {
-        let cacheKey = "\(window.identity)@\(ScreenGeometryEngine.signature(for: screen))"
-        if let cached = sizeLimitsCache[cacheKey] { return cached }
-        guard window.sizeIsSettable else {
-            let limits = SizeLimits(minimum: window.currentSize, maximum: window.currentSize)
-            sizeLimitsCache[cacheKey] = limits
-            return limits
+    private func finish(frame: CGRect, for element: AXUIElement) -> ApplyResult {
+        let outcome = request(frame: frame, for: element)
+        guard outcome.moved else { return .failed }
+        guard outcome.resized, let actual = sizeAttribute(kAXSizeAttribute, from: element) else {
+            return centerConstrainedWindow(element, in: frame)
         }
+        let widthGap = abs(actual.width - frame.width)
+        let heightGap = abs(actual.height - frame.height)
+        if widthGap <= sizeTolerance && heightGap <= sizeTolerance { return .tiled }
+        // A grid-snapped window a few points short of its tile is still a
+        // tiled window; center the small difference instead of reporting it
+        // as bounded.
+        let snapped = widthGap <= boundedTolerance && heightGap <= boundedTolerance
+        let centered = centerConstrainedWindow(element, in: frame)
+        return snapped && centered == .constrained ? .tiled : centered
+    }
 
-        var probe = CGSize(width: 80, height: 80)
-        var probePosition = screen.origin
-        if let positionValue = AXValueCreate(.cgPoint, &probePosition) {
-            AXUIElementSetAttributeValue(window.element, kAXPositionAttribute as CFString, positionValue)
-        }
-        if let probeValue = AXValueCreate(.cgSize, &probe) {
-            AXUIElementSetAttributeValue(window.element, kAXSizeAttribute as CFString, probeValue)
-        }
-        usleep(20_000)
-        let minimumActual = sizeAttribute(kAXSizeAttribute, from: window.element) ?? window.currentSize
+    private func applyBounded(frame: CGRect, to element: AXUIElement) -> Bool {
+        let outcome = request(frame: frame, for: element)
+        return outcome.moved && (outcome.resized || !isAttributeSettable(kAXSizeAttribute, on: element))
+    }
 
-        probe = CGSize(width: screen.width * 2, height: screen.height * 2)
-        if let probeValue = AXValueCreate(.cgSize, &probe) {
-            AXUIElementSetAttributeValue(window.element, kAXSizeAttribute as CFString, probeValue)
-        }
-        usleep(20_000)
-        let maximumActual = sizeAttribute(kAXSizeAttribute, from: window.element) ?? window.currentSize
-
-        var restore = window.currentSize
-        if let restoreValue = AXValueCreate(.cgSize, &restore) {
-            AXUIElementSetAttributeValue(window.element, kAXSizeAttribute as CFString, restoreValue)
-        }
-        var restorePosition = window.currentPosition
-        if let restorePositionValue = AXValueCreate(.cgPoint, &restorePosition) {
-            AXUIElementSetAttributeValue(window.element, kAXPositionAttribute as CFString, restorePositionValue)
-        }
-
-        let minimum = CGSize(width: max(320, minimumActual.width), height: max(240, minimumActual.height))
-        let maximum = CGSize(
-            width: max(minimum.width, min(screen.width, maximumActual.width)),
-            height: max(minimum.height, min(screen.height, maximumActual.height))
+    /// Some apps accept a resize request but clamp it to a fixed or minimum
+    /// size. They cannot be scaled by the public macOS window API, so center
+    /// their actual native size in the equal tile instead of leaving them at
+    /// an arbitrary position.
+    private func centerConstrainedWindow(_ element: AXUIElement, in frame: CGRect) -> ApplyResult {
+        guard let actualSize = sizeAttribute(kAXSizeAttribute, from: element) else { return .failed }
+        var centered = CGPoint(
+            x: frame.midX - actualSize.width / 2,
+            y: frame.midY - actualSize.height / 2
         )
-        let limits = SizeLimits(minimum: minimum, maximum: maximum)
-        sizeLimitsCache[cacheKey] = limits
-        return limits
+        guard let centeredValue = AXValueCreate(.cgPoint, &centered) else { return .failed }
+        return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, centeredValue) == .success
+            ? .constrained
+            : .failed
     }
+
+    // MARK: - Discovering windows
 
     /// Ignores window position and size so our own tiling does not trigger a
     /// loop, but changes when a visible window opens, closes, or minimizes.
@@ -202,51 +309,126 @@ final class WindowTiler {
 
     private func eligibleWindows() -> [Window] {
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        return NSWorkspace.shared.runningApplications
-            .filter {
-                $0.activationPolicy == .regular
-                    && !$0.isTerminated
-                    && !$0.isHidden
-                    && $0.processIdentifier != ownPID
+        let onScreen = onScreenWindowsByProcess()
+        let running = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular
+                && !$0.isTerminated
+                && !$0.isHidden
+                && $0.processIdentifier != ownPID
+        }
+        let livePIDs = Set(running.map(\.processIdentifier))
+        applicationElements = applicationElements.filter { livePIDs.contains($0.key) }
+        unresponsiveUntil = unresponsiveUntil.filter { livePIDs.contains($0.key) && $0.value > Date() }
+
+        return running
+            .flatMap { app -> [Window] in
+                // The Accessibility window list contains windows on every
+                // Space. Only windows the system currently draws on screen
+                // take part in the layout; if the on-screen list is not
+                // available, fall back to accepting every window.
+                windows(
+                    for: app.processIdentifier,
+                    appName: app.localizedName ?? app.bundleIdentifier ?? "App",
+                    bundleIdentifier: app.bundleIdentifier,
+                    onScreen: onScreen.map { $0[app.processIdentifier] ?? [] }
+                )
             }
-            .flatMap { windows(
-                for: $0.processIdentifier,
-                appName: $0.localizedName ?? $0.bundleIdentifier ?? "App",
-                bundleIdentifier: $0.bundleIdentifier
-            ) }
             .sorted { $0.identity < $1.identity }
     }
 
-    private func windows(for pid: pid_t, appName: String, bundleIdentifier: String?) -> [Window] {
-        let app = AXUIElementCreateApplication(pid)
-        guard let elements = attribute(kAXWindowsAttribute, from: app) as? [AXUIElement] else { return [] }
+    private func applicationElement(for pid: pid_t) -> AXUIElement {
+        if let element = applicationElements[pid] { return element }
+        let element = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(element, messagingTimeout)
+        applicationElements[pid] = element
+        return element
+    }
 
-        return elements.compactMap { element in
+    private func windows(
+        for pid: pid_t,
+        appName: String,
+        bundleIdentifier: String?,
+        onScreen: [OnScreenWindow]?
+    ) -> [Window] {
+        if let blockedUntil = unresponsiveUntil[pid], blockedUntil > Date() { return [] }
+        let app = applicationElement(for: pid)
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
+        if status == .cannotComplete {
+            // The app did not answer within the messaging timeout. Leave it
+            // alone for a while instead of stalling on every request.
+            unresponsiveUntil[pid] = Date().addingTimeInterval(unresponsiveCooldown)
+            return []
+        }
+        guard status == .success, let elements = value as? [AXUIElement] else { return [] }
+
+        var standard: [Window] = []
+        var dialogs: [Window] = []
+        for element in elements {
             let subrole = attribute(kAXSubroleAttribute, from: element) as? String
+            let isStandard = subrole == kAXStandardWindowSubrole
+            let isDialog = subrole == kAXDialogSubrole
+            guard isStandard || isDialog else { continue }
             let title = attribute(kAXTitleAttribute, from: element) as? String
-            let isAppWindow = subrole == kAXStandardWindowSubrole || subrole == kAXDialogSubrole
             guard (attribute(kAXRoleAttribute, from: element) as? String) == kAXWindowRole,
-                  isAppWindow,
                   // Wispr exposes a large transparent status HUD as a window.
                   // Tiling it creates what looks like an empty desktop tile.
                   !(bundleIdentifier == "com.electron.wispr-flow" && title == "Status"),
                   (attribute(kAXMinimizedAttribute, from: element) as? Bool) != true,
                   let position = pointAttribute(kAXPositionAttribute, from: element),
                   let size = sizeAttribute(kAXSizeAttribute, from: element),
-                  size.width > 80, size.height > 80 else { return nil }
+                  size.width > 80, size.height > 80 else { continue }
 
-            let identity = "\(pid):\(CFHash(element))"
-            return Window(
+            let frame = CGRect(origin: position, size: size)
+            let identity: String
+            if let onScreen {
+                guard let match = onScreen.first(where: { matches($0.bounds, frame) }) else { continue }
+                identity = "\(pid):w\(match.number)"
+            } else {
+                identity = "\(pid):h\(CFHash(element))"
+            }
+            let window = Window(
                 element: element,
                 name: title.flatMap { $0.isEmpty ? nil : $0 } ?? appName,
-                center: CGPoint(x: position.x + size.width / 2, y: position.y + size.height / 2),
+                center: CGPoint(x: frame.midX, y: frame.midY),
                 identity: identity,
                 currentPosition: position,
                 currentSize: size,
                 sizeIsSettable: isAttributeSettable(kAXSizeAttribute, on: element)
             )
+            if isStandard { standard.append(window) } else { dialogs.append(window) }
         }
+        // Dialogs count only when they are the app's main window. Open and
+        // Save panels of an app that already has a normal window would
+        // otherwise reflow the whole desktop twice.
+        return standard.isEmpty ? dialogs : standard
     }
+
+    private func matches(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= 2 && abs(lhs.minY - rhs.minY) <= 2
+            && abs(lhs.width - rhs.width) <= 2 && abs(lhs.height - rhs.height) <= 2
+    }
+
+    /// Windows the window server currently draws, grouped by owning process.
+    /// Returns nil if the list cannot be read. No Screen Recording permission
+    /// is needed for bounds and owner; only window titles require it.
+    private func onScreenWindowsByProcess() -> [pid_t: [OnScreenWindow]]? {
+        guard let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        var result: [pid_t: [OnScreenWindow]] = [:]
+        for info in list {
+            guard (info[kCGWindowLayer as String] as? Int) == 0,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                  let number = info[kCGWindowNumber as String] as? Int,
+                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: boundsDictionary) else { continue }
+            result[pid, default: []].append(OnScreenWindow(number: number, bounds: bounds))
+        }
+        return result
+    }
+
+    // MARK: - Accessibility helpers
 
     private func isAttributeSettable(_ name: String, on element: AXUIElement) -> Bool {
         var settable = DarwinBoolean(false)
@@ -273,65 +455,6 @@ final class WindowTiler {
         guard AXValueGetValue(value as! AXValue, .cgSize, &size) else { return nil }
         return size
     }
-
-    private func apply(frame: CGRect, to element: AXUIElement) -> ApplyResult {
-        var position = frame.origin
-        var size = frame.size
-        guard let positionValue = AXValueCreate(.cgPoint, &position),
-              let sizeValue = AXValueCreate(.cgSize, &size) else { return .failed }
-
-        // Moving before and after resizing handles apps that constrain their size at screen edges.
-        let firstMove = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
-        let resize = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
-        let finalMove = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
-        guard firstMove == .success || finalMove == .success else { return .failed }
-
-        guard resize == .success,
-              var actualSize = sizeAttribute(kAXSizeAttribute, from: element) else {
-            return centerConstrainedWindow(element, in: frame)
-        }
-
-        var sizeMatches = abs(actualSize.width - frame.width) <= 2
-            && abs(actualSize.height - frame.height) <= 2
-        // Some apps (notably System Settings) recalculate their content size
-        // after each request. A few quick identical requests converge on the
-        // shared boundary instead of leaving the window slightly too tall.
-        var previousSize = actualSize
-        for _ in 0..<8 where !sizeMatches {
-            AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeValue)
-            usleep(20_000)
-            AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
-            if let retriedSize = sizeAttribute(kAXSizeAttribute, from: element) {
-                actualSize = retriedSize
-                sizeMatches = abs(actualSize.width - frame.width) <= 2
-                    && abs(actualSize.height - frame.height) <= 2
-                if !sizeMatches,
-                   abs(actualSize.width - previousSize.width) < 0.5,
-                   abs(actualSize.height - previousSize.height) < 0.5 {
-                    break
-                }
-                previousSize = actualSize
-            }
-        }
-        return sizeMatches ? .tiled : centerConstrainedWindow(element, in: frame)
-    }
-
-    /// Some apps accept a resize request but clamp it to a fixed or minimum
-    /// size. They cannot be scaled by the public macOS window API, so center
-    /// their actual native size in the equal tile instead of leaving them at
-    /// an arbitrary position.
-    private func centerConstrainedWindow(_ element: AXUIElement, in frame: CGRect) -> ApplyResult {
-        guard let actualSize = sizeAttribute(kAXSizeAttribute, from: element) else { return .failed }
-        var centered = CGPoint(
-            x: frame.midX - actualSize.width / 2,
-            y: frame.midY - actualSize.height / 2
-        )
-        guard let centeredValue = AXValueCreate(.cgPoint, &centered) else { return .failed }
-        return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, centeredValue) == .success
-            ? .constrained
-            : .failed
-    }
-
 
     private func screenBoundsInAccessibilityCoordinates() -> [CGRect] {
         guard let primary = NSScreen.screens.first else { return [] }

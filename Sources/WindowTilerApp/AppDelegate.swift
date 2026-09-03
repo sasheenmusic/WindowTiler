@@ -4,14 +4,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tiler = WindowTiler()
     private var statusItem: NSStatusItem!
     private var hotKeyManager: HotKeyManager!
+    private var eventMonitor: WindowEventMonitor?
     private var shortcutItems: [NSMenuItem] = []
     private var autoRetileItem: NSMenuItem!
-    private var monitorTimer: Timer?
+    private var settleTimer: Timer?
+    private var safetyNetTimer: Timer?
     private var lastTopology: String?
-    private var pendingTopology: String?
-    private var pendingTopologySince: Date?
-    private let monitorInterval: TimeInterval = 0.1
-    private let topologySettleTime: TimeInterval = 0.2
+    private var isTiling = false
+    /// Window events arrive in bursts (an app opening three windows, a Space
+    /// switch). Wait for them to stop before reading the window list once.
+    private let settleTime: TimeInterval = 0.25
+    /// Accessibility observers can miss an app that was still starting up.
+    /// A slow poll catches anything the observers did not report.
+    private let safetyNetInterval: TimeInterval = 3
     private let shortcutDefaultsKey = "shortcutIndex"
     private let autoRetileDefaultsKey = "autoRetile"
 
@@ -23,11 +28,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "rectangle.grid.2x2", accessibilityDescription: "Window Tiler")
         hotKeyManager = HotKeyManager { [weak self] in self?.tileWindows() }
         buildMenu()
-        selectShortcut(index: savedShortcutIndex())
-        startWindowMonitor()
+        selectShortcut(index: savedShortcutIndex(), interactive: false)
 
         let accessibilityEnabled = tiler.isAccessibilityEnabled(prompt: true)
         UserDefaults.standard.set(accessibilityEnabled, forKey: "diagnostics.accessibilityEnabled")
+        startWindowMonitor()
         if !accessibilityEnabled {
             showPermissionHelp()
         }
@@ -79,10 +84,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func shortcutSelected(_ sender: NSMenuItem) {
-        selectShortcut(index: sender.tag)
+        selectShortcut(index: sender.tag, interactive: true)
     }
 
-    private func selectShortcut(index: Int) {
+    /// - Parameter interactive: the user just picked this shortcut, so a
+    ///   failure deserves an alert. At launch a failure is only logged; a
+    ///   modal alert there would block startup.
+    private func selectShortcut(index: Int, interactive: Bool) {
         guard HotKeyChoice.choices.indices.contains(index) else { return }
         let registered = hotKeyManager.register(HotKeyChoice.choices[index])
         UserDefaults.standard.set(registered, forKey: "diagnostics.hotKeyRegistered")
@@ -93,37 +101,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.toolTip = "Window Tiler — \(HotKeyChoice.choices[index].title)"
         } else {
             NSLog("Window Tiler could not register shortcut %@", HotKeyChoice.choices[index].title)
-            showAlert(title: "Shortcut unavailable", message: "Another app is already using that shortcut. Choose a different one from the Window Tiler menu.")
+            statusItem.button?.toolTip = "Window Tiler — no shortcut registered"
+            if interactive {
+                showAlert(title: "Shortcut unavailable", message: "Another app is already using that shortcut. Choose a different one from the Window Tiler menu.")
+            }
         }
     }
 
     @objc private func tileWindows() {
-        performTile(showFeedback: true, reason: "hotkey or menu")
+        performTile(showFeedback: true, relearn: true, reason: "hotkey or menu")
     }
 
-    private func performTile(showFeedback: Bool, reason: String) {
-        guard tiler.isAccessibilityEnabled(prompt: true) else {
+    private func performTile(showFeedback: Bool, relearn: Bool, reason: String) {
+        guard tiler.isAccessibilityEnabled(prompt: showFeedback) else {
             if showFeedback { showPermissionHelp() }
             return
         }
+        guard !isTiling else { return }
+        isTiling = true
+        defer { isTiling = false }
+
         let started = CFAbsoluteTimeGetCurrent()
-        let result = tiler.tileAllWindows()
+        let result = tiler.tileAllWindows(relearn: relearn)
         let durationMilliseconds = Int((CFAbsoluteTimeGetCurrent() - started) * 1_000)
         lastTopology = tiler.windowTopologySignature()
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "diagnostics.lastTileAt")
-        UserDefaults.standard.set(reason, forKey: "diagnostics.lastTileReason")
-        UserDefaults.standard.set(result.tiled, forKey: "diagnostics.lastTiledCount")
-        UserDefaults.standard.set(result.constrained, forKey: "diagnostics.lastConstrainedCount")
-        UserDefaults.standard.set(result.failed, forKey: "diagnostics.lastFailedCount")
-        UserDefaults.standard.set(durationMilliseconds, forKey: "diagnostics.lastTileDurationMilliseconds")
+        UserDefaults.standard.set([
+            "lastTileAt": Date().timeIntervalSince1970,
+            "lastTileReason": reason,
+            "lastTiledCount": result.tiled,
+            "lastConstrainedCount": result.constrained,
+            "lastFailedCount": result.failed,
+            "lastTileDurationMilliseconds": durationMilliseconds,
+        ] as [String: Any], forKey: "diagnostics.lastTile")
         NSLog(
-            "Window Tiler [%@]: tiled %d, fixed-size %d, failed %d",
+            "Window Tiler [%@]: tiled %d, fixed-size %d, failed %d in %d ms",
             reason,
             result.tiled,
             result.constrained,
-            result.failed
+            result.failed,
+            durationMilliseconds
         )
-        if showFeedback && result.tiled == 0 {
+        if showFeedback && result.tiled == 0 && result.constrained == 0 {
             showAlert(title: "No windows tiled", message: "No normal app windows were available to move.")
         } else if showFeedback && (result.constrained > 0 || result.failed > 0) {
             var details = "Tiled \(result.tiled) resizable windows."
@@ -142,40 +160,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(enabled, forKey: autoRetileDefaultsKey)
         autoRetileItem.state = enabled ? .on : .off
         lastTopology = tiler.windowTopologySignature()
-        if enabled { performTile(showFeedback: false, reason: "automatic re-tiling enabled") }
+        if enabled { performTile(showFeedback: false, relearn: false, reason: "automatic re-tiling enabled") }
     }
+
+    // MARK: - Watching for window changes
 
     private func startWindowMonitor() {
         lastTopology = tiler.windowTopologySignature()
-        monitorTimer = Timer.scheduledTimer(withTimeInterval: monitorInterval, repeats: true) { [weak self] _ in
+        eventMonitor = WindowEventMonitor { [weak self] in self?.windowsMayHaveChanged() }
+        safetyNetTimer = Timer.scheduledTimer(withTimeInterval: safetyNetInterval, repeats: true) { [weak self] _ in
+            self?.eventMonitor?.refresh()
             self?.checkForWindowChanges()
         }
-        if let monitorTimer {
-            RunLoop.main.add(monitorTimer, forMode: .common)
+        safetyNetTimer?.tolerance = safetyNetInterval / 2
+    }
+
+    /// Called for every window event. Restarts the settle timer so one check
+    /// runs after the burst ends.
+    private func windowsMayHaveChanged() {
+        guard isAutoRetileEnabled else { return }
+        settleTimer?.invalidate()
+        settleTimer = Timer.scheduledTimer(withTimeInterval: settleTime, repeats: false) { [weak self] _ in
+            self?.checkForWindowChanges()
         }
     }
 
     private func checkForWindowChanges() {
-        guard isAutoRetileEnabled, tiler.isAccessibilityEnabled(prompt: false) else { return }
+        guard isAutoRetileEnabled,
+              !isTiling,
+              NSApp.modalWindow == nil,
+              tiler.isAccessibilityEnabled(prompt: false) else { return }
         let topology = tiler.windowTopologySignature()
-        guard topology != lastTopology else {
-            pendingTopology = nil
-            pendingTopologySince = nil
-            return
-        }
-        if topology != pendingTopology {
-            pendingTopology = topology
-            pendingTopologySince = Date()
-            return
-        }
-        guard let since = pendingTopologySince,
-              Date().timeIntervalSince(since) >= topologySettleTime else { return }
+        guard topology != lastTopology else { return }
         NSLog("Window Tiler detected a visible window-set change")
-        pendingTopology = nil
-        pendingTopologySince = nil
         lastTopology = topology
-        performTile(showFeedback: false, reason: "visible window set changed")
+        performTile(showFeedback: false, relearn: false, reason: "visible window set changed")
     }
+
+    // MARK: - Alerts
 
     private func showPermissionHelp() {
         showAlert(
@@ -185,7 +207,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showAlert(title: String, message: String) {
-        NSApp.activate(ignoringOtherApps: true)
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message

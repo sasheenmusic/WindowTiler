@@ -107,7 +107,7 @@ public enum MosaicLayoutEngine {
     }
 
     private static func score(_ candidate: Candidate, flexibleCount: Int) -> Double {
-        let usable = candidate.freeRegions.filter { $0.width >= 320 && $0.height >= 240 }
+        let usable = candidate.freeRegions.filter(TilingLimits.isUsableRegion)
         let fillable = min(usable.count, flexibleCount)
         let unfilledArea = usable
             .sorted { $0.width * $0.height > $1.width * $1.height }
@@ -121,7 +121,7 @@ public enum MosaicLayoutEngine {
         guard !minimumSizes.isEmpty else { return [] }
 
         let usableRegions = regions
-            .filter { $0.width >= 320 && $0.height >= 240 }
+            .filter(TilingLimits.isUsableRegion)
             .sorted { $0.width * $0.height > $1.width * $1.height }
         guard !usableRegions.isEmpty else { return [] }
 
