@@ -344,7 +344,14 @@ final class WindowTiler {
                 tiled += 1
                 continue
             }
-            switch finish(frame: layout.flexibleFrames[position], for: windows[index].element, snapAllowance: allowance) {
+            // A window that overshot gets the reduced request here too, so
+            // it ends inside its tile once the app catches up.
+            var frame = layout.flexibleFrames[position]
+            if let shrink = shrinkRetries[windows[index].identity] {
+                frame.size.width -= shrink.width
+                frame.size.height -= shrink.height
+            }
+            switch finish(frame: layout.flexibleFrames[position], requesting: frame, for: windows[index].element, snapAllowance: allowance) {
             case .tiled: tiled += 1
             case .constrained: constrainedCount += 1
             case .failed: failed += 1
@@ -507,8 +514,12 @@ final class WindowTiler {
         return (firstMove == .success || finalMove == .success, resize == .success)
     }
 
-    private func finish(frame: CGRect, for element: AXUIElement, snapAllowance: CGSize?) -> ApplyResult {
-        let outcome = request(frame: frame, for: element)
+    /// - Parameters:
+    ///   - frame: the tile the window should occupy.
+    ///   - requested: what to ask for, possibly a little smaller than the
+    ///     tile for a window that rounds its size up.
+    private func finish(frame: CGRect, requesting requested: CGRect, for element: AXUIElement, snapAllowance: CGSize?) -> ApplyResult {
+        let outcome = request(frame: requested, for: element)
         guard outcome.moved, !isQuarantined(element) else { return .failed }
         guard outcome.resized, let actual = sizeAttribute(kAXSizeAttribute, from: element) else {
             return centerConstrainedWindow(element, in: frame)
