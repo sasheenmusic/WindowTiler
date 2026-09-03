@@ -2,6 +2,12 @@ import AppKit
 import ApplicationServices
 import WindowTilerCore
 
+/// Returns the window server's id for an Accessibility window. Not in the
+/// public headers, but it has been stable for many macOS releases and every
+/// tiling manager (Amethyst, yabai, Rectangle) relies on it.
+@_silgen_name("_AXUIElementGetWindow")
+private func windowServerID(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
+
 struct TilingResult {
     let tiled: Int
     let constrained: Int
@@ -24,6 +30,7 @@ final class WindowTiler {
 
     private struct Window {
         let element: AXUIElement
+        let pid: pid_t
         let name: String
         let center: CGPoint
         let identity: String
@@ -51,6 +58,7 @@ final class WindowTiler {
     private var applicationElements: [pid_t: AXUIElement] = [:]
     private var unresponsiveUntil: [pid_t: Date] = [:]
     private let systemWideElement = AXUIElementCreateSystemWide()
+    private let enhancedUserInterfaceAttribute = "AXEnhancedUserInterface"
 
     /// Seconds to wait for another app before giving up on an Accessibility
     /// request. The default is six seconds per request, which lets one hung
@@ -99,6 +107,9 @@ final class WindowTiler {
             grouped[screenIndex].append(window)
         }
 
+        let enhancedUIApps = disableEnhancedUserInterface(for: Set(windows.map(\.pid)))
+        defer { restoreEnhancedUserInterface(for: enhancedUIApps) }
+
         var tiled = 0
         var constrained = 0
         var failed = 0
@@ -111,6 +122,23 @@ final class WindowTiler {
         }
         UserDefaults.standard.set(summaries.joined(separator: " | "), forKey: "diagnostics.lastLayout")
         return .init(tiled: tiled, constrained: constrained, failed: failed)
+    }
+
+    /// With this flag set (assistive apps turn it on), Chromium and Electron
+    /// apps animate or refuse moves and resizes. Switch it off for the apps
+    /// being tiled and put it back afterwards; returns the apps that had it.
+    private func disableEnhancedUserInterface(for pids: Set<pid_t>) -> [pid_t] {
+        pids.filter { pid in
+            let app = applicationElement(for: pid)
+            guard (attribute(enhancedUserInterfaceAttribute, from: app) as? Bool) == true else { return false }
+            return AXUIElementSetAttributeValue(app, enhancedUserInterfaceAttribute as CFString, kCFBooleanFalse) == .success
+        }
+    }
+
+    private func restoreEnhancedUserInterface(for pids: [pid_t]) {
+        for pid in pids {
+            AXUIElementSetAttributeValue(applicationElement(for: pid), enhancedUserInterfaceAttribute as CFString, kCFBooleanTrue)
+        }
     }
 
     // MARK: - Tiling one screen
@@ -129,6 +157,9 @@ final class WindowTiler {
         var boundedIndices: [Int] = []
         var flexibleIndices: [Int] = []
         var layout = MosaicLayout(constrainedFrames: [], flexibleFrames: [])
+        // Where each window was last seen. A window already sitting in its
+        // tile is left alone: no request, no self-triggered move event.
+        var observed = windows.map { CGRect(origin: $0.currentPosition, size: $0.currentSize) }
 
         // Each pass asks every window for its tile, then reads back what the
         // window really did. Windows that refuse to shrink teach us a minimum,
@@ -138,12 +169,19 @@ final class WindowTiler {
             (layout, bounded, boundedIndices, flexibleIndices) = partition(
                 windows: windows, limits: limits, bounded: bounded, in: screen
             )
-            for (position, index) in boundedIndices.enumerated() {
+            var requestedAny = false
+            for (position, index) in boundedIndices.enumerated()
+            where !isSettled(observed[index], in: layout.constrainedFrames[position], allowance: nil) {
                 request(frame: layout.constrainedFrames[position], for: windows[index].element)
+                requestedAny = true
             }
-            for (position, index) in flexibleIndices.enumerated() where position < layout.flexibleFrames.count {
+            for (position, index) in flexibleIndices.enumerated()
+            where position < layout.flexibleFrames.count
+                && !isSettled(observed[index], in: layout.flexibleFrames[position], allowance: snapAllowances[windows[index].identity]) {
                 request(frame: layout.flexibleFrames[position], for: windows[index].element)
+                requestedAny = true
             }
+            guard requestedAny else { break }
             // One settle for the whole screen instead of a sleep per window.
             usleep(40_000)
 
@@ -151,6 +189,9 @@ final class WindowTiler {
             for (position, index) in flexibleIndices.enumerated() where position < layout.flexibleFrames.count {
                 let requested = layout.flexibleFrames[position].size
                 guard let actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
+                if let origin = pointAttribute(kAXPositionAttribute, from: windows[index].element) {
+                    observed[index] = CGRect(origin: origin, size: actual)
+                }
                 // A deviation within one grid cell is snapping and must not
                 // be recorded as a limit: a 12-point shortfall in a short
                 // tile would otherwise become a hard maximum that later
@@ -183,7 +224,8 @@ final class WindowTiler {
         var constrainedCount = 0
         var failed = 0
         for (position, index) in boundedIndices.enumerated() {
-            if applyBounded(frame: layout.constrainedFrames[position], to: windows[index].element) {
+            if isSettled(observed[index], in: layout.constrainedFrames[position], allowance: nil)
+                || applyBounded(frame: layout.constrainedFrames[position], to: windows[index].element) {
                 constrainedCount += 1
             } else {
                 failed += 1
@@ -196,11 +238,12 @@ final class WindowTiler {
                 failed += 1
                 continue
             }
-            switch finish(
-                frame: layout.flexibleFrames[position],
-                for: windows[index].element,
-                snapAllowance: snapAllowances[windows[index].identity]
-            ) {
+            let allowance = snapAllowances[windows[index].identity]
+            if isSettled(observed[index], in: layout.flexibleFrames[position], allowance: allowance) {
+                tiled += 1
+                continue
+            }
+            switch finish(frame: layout.flexibleFrames[position], for: windows[index].element, snapAllowance: allowance) {
             case .tiled: tiled += 1
             case .constrained: constrainedCount += 1
             case .failed: failed += 1
@@ -243,6 +286,16 @@ final class WindowTiler {
             bounded.formUnion(newlyBounded)
         }
         return (layout, bounded, boundedIndices, flexibleIndices)
+    }
+
+    /// True when a window sits at its tile's origin and within its size
+    /// wiggle room, so no request is needed.
+    private func isSettled(_ observed: CGRect, in frame: CGRect, allowance: CGSize?) -> Bool {
+        let wiggle = allowance ?? .zero
+        return abs(observed.minX - frame.minX) <= sizeTolerance
+            && abs(observed.minY - frame.minY) <= sizeTolerance
+            && abs(observed.width - frame.width) <= max(wiggle.width, sizeTolerance)
+            && abs(observed.height - frame.height) <= max(wiggle.height, sizeTolerance)
     }
 
     private func clamp(_ limits: SizeLimits, to screen: CGRect) -> SizeLimits {
@@ -424,7 +477,12 @@ final class WindowTiler {
 
             let frame = CGRect(origin: position, size: size)
             let identity: String
-            if onScreen != nil {
+            var number: CGWindowID = 0
+            if windowServerID(element, &number) == .success, number != 0 {
+                if onScreen != nil, !(onScreen!.contains { $0.number == Int(number) }) { continue }
+                identity = "\(pid):w\(number)"
+            } else if onScreen != nil {
+                // Fallback for the rare window with no id: match by frame.
                 guard let matchIndex = unclaimed?.firstIndex(where: { matches($0.bounds, frame) }),
                       let match = unclaimed?.remove(at: matchIndex) else { continue }
                 identity = "\(pid):w\(match.number)"
@@ -433,6 +491,7 @@ final class WindowTiler {
             }
             let window = Window(
                 element: element,
+                pid: pid,
                 name: title.flatMap { $0.isEmpty ? nil : $0 } ?? appName,
                 center: CGPoint(x: frame.midX, y: frame.midY),
                 identity: identity,
