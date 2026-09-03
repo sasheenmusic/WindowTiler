@@ -30,7 +30,10 @@ private final class LiveTestDelegate: NSObject, NSApplicationDelegate {
     private var windows: [NSWindow] = []
     private var appsHiddenForTest: [NSRunningApplication] = []
     private var checks: [Check] = []
-    private let tilerDefaults = UserDefaults(suiteName: "com.windowtiler.app")!
+    /// Every tile the app performs, as posted on its didTile distributed
+    /// notification: (sequence number, reason, tiled + constrained, failed).
+    private var tiles: [(sequence: Int, reason: String, count: Int, failed: Int)] = []
+    private var tileObserver: NSObjectProtocol?
     private let maximumWindowCount = max(
         1,
         Int(ProcessInfo.processInfo.environment["WINDOW_TILER_TEST_COUNT"] ?? "10") ?? 10
@@ -39,6 +42,19 @@ private final class LiveTestDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        tileObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.windowtiler.app.didTile"),
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self, let info = note.userInfo else { return }
+            self.tiles.append((
+                sequence: self.tiles.count + 1,
+                reason: info["reason"] as? String ?? "",
+                count: (info["tiled"] as? Int ?? 0) + (info["constrained"] as? Int ?? 0),
+                failed: info["failed"] as? Int ?? 0
+            ))
+        }
         hideOtherApps()
         createWindows()
         Task {
@@ -134,22 +150,16 @@ private final class LiveTestDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func lastTileTime() -> Double {
-        tilerDefaults.synchronize()
-        return tilerDefaults.double(forKey: "diagnostics.lastTileAt")
+    private func lastTileTime() -> Int {
+        tiles.last?.sequence ?? 0
     }
 
-    private func waitForAutomaticRetile(after previous: Double, expectedCount: Int) async -> (observed: Bool, milliseconds: Int) {
+    private func waitForAutomaticRetile(after previous: Int, expectedCount: Int) async -> (observed: Bool, milliseconds: Int) {
         let started = Date()
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline {
-            tilerDefaults.synchronize()
-            let time = tilerDefaults.double(forKey: "diagnostics.lastTileAt")
-            let reason = tilerDefaults.string(forKey: "diagnostics.lastTileReason")
-            let count = tilerDefaults.integer(forKey: "diagnostics.lastTiledCount")
-                + tilerDefaults.integer(forKey: "diagnostics.lastConstrainedCount")
-            let failed = tilerDefaults.integer(forKey: "diagnostics.lastFailedCount")
-            if time > previous, reason == "visible window set changed", count == expectedCount, failed == 0 {
+            if let tile = tiles.last(where: { $0.sequence > previous }),
+               tile.reason == "visible window set changed", tile.count == expectedCount, tile.failed == 0 {
                 await sleep(milliseconds: 350)
                 return (true, Int(Date().timeIntervalSince(started) * 1_000) - 350)
             }

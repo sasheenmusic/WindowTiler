@@ -6,6 +6,10 @@ import ApplicationServices
 /// system for launches, quits, hides, Space switches, and display changes.
 final class WindowEventMonitor {
     private var observers: [pid_t: AXObserver] = [:]
+    /// Apps whose attachment timed out; not retried before this date.
+    private var retryAfter: [pid_t: Date] = [:]
+    private let messagingTimeout: Float = 1.0
+    private let attachCooldown: TimeInterval = 5
     private var workspaceTokens: [NSObjectProtocol] = []
     private let onChange: () -> Void
 
@@ -64,7 +68,8 @@ final class WindowEventMonitor {
             detach(observer)
             observers[pid] = nil
         }
-        for pid in livePIDs where observers[pid] == nil {
+        retryAfter = retryAfter.filter { livePIDs.contains($0.key) && $0.value > Date() }
+        for pid in livePIDs where observers[pid] == nil && retryAfter[pid] == nil {
             attach(pid: pid)
         }
     }
@@ -84,34 +89,53 @@ final class WindowEventMonitor {
         guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { return }
 
         let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, messagingTimeout)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         // An app that is still starting up may refuse registrations or its
         // window list. Nothing is recorded unless every required step
         // succeeds, so the next refresh tries the whole attachment again.
-        var complete = true
+        // An app that does not answer at all is left alone for a while
+        // after its first timeout instead of paying one per registration.
         for name in Self.applicationNotifications {
             let status = AXObserverAddNotification(observer, app, name as CFString, refcon)
-            // A notification the app simply does not support is not a failure.
-            if status != .success && status != .notificationAlreadyRegistered && status != .notificationUnsupported {
-                complete = false
+            if status == .cannotComplete {
+                retryAfter[pid] = Date().addingTimeInterval(attachCooldown)
+                return
             }
+            // A notification the app simply does not support is not a failure.
+            guard status == .success || status == .notificationAlreadyRegistered || status == .notificationUnsupported else { return }
         }
         var value: CFTypeRef?
-        guard complete,
-              AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-              let windows = value as? [AXUIElement],
-              windows.allSatisfy({ watchWindow($0, with: observer) }) else { return }
+        let status = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
+        if status == .cannotComplete {
+            retryAfter[pid] = Date().addingTimeInterval(attachCooldown)
+            return
+        }
+        guard status == .success, let windows = value as? [AXUIElement] else { return }
+        for window in windows {
+            switch watchWindow(window, with: observer) {
+            case .success: continue
+            case .timedOut:
+                retryAfter[pid] = Date().addingTimeInterval(attachCooldown)
+                return
+            case .failed: return
+            }
+        }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         observers[pid] = observer
     }
 
+    private enum WatchResult { case success, timedOut, failed }
+
     @discardableResult
-    private func watchWindow(_ window: AXUIElement, with observer: AXObserver) -> Bool {
+    private func watchWindow(_ window: AXUIElement, with observer: AXObserver) -> WatchResult {
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        return Self.windowNotifications.allSatisfy { name in
+        for name in Self.windowNotifications {
             let status = AXObserverAddNotification(observer, window, name as CFString, refcon)
-            return status == .success || status == .notificationAlreadyRegistered || status == .notificationUnsupported
+            if status == .cannotComplete { return .timedOut }
+            guard status == .success || status == .notificationAlreadyRegistered || status == .notificationUnsupported else { return .failed }
         }
+        return .success
     }
 
     private func detach(_ observer: AXObserver) {

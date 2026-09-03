@@ -146,13 +146,16 @@ final class WindowTiler {
         pids.filter { pid in
             let app = applicationElement(for: pid)
             guard (attribute(enhancedUserInterfaceAttribute, from: app) as? Bool) == true else { return false }
-            return AXUIElementSetAttributeValue(app, enhancedUserInterfaceAttribute as CFString, kCFBooleanFalse) == .success
+            return setAttribute(enhancedUserInterfaceAttribute, to: kCFBooleanFalse, on: app)
         }
     }
 
+    /// Skips an app that was quarantined while tiling; the flag is restored
+    /// on the next tile once the app answers again, since disabling it is
+    /// only ever attempted after a successful read.
     private func restoreEnhancedUserInterface(for pids: [pid_t]) {
-        for pid in pids {
-            AXUIElementSetAttributeValue(applicationElement(for: pid), enhancedUserInterfaceAttribute as CFString, kCFBooleanTrue)
+        for pid in pids where !isQuarantined(pid) {
+            setAttribute(enhancedUserInterfaceAttribute, to: kCFBooleanTrue, on: applicationElement(for: pid))
         }
     }
 
@@ -190,11 +193,21 @@ final class WindowTiler {
             )
             learnedOnLastPass = false
             guard !confirmed.isEmpty else { break }
+            let before = observed
             settle()
 
             for (position, index) in flexibleIndices.enumerated()
             where position < layout.flexibleFrames.count && !isQuarantined(windows[index].pid) {
-                guard let actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
+                guard var actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
+                let requested = layout.flexibleFrames[position].size
+                // An accepted request only means the app took it. If the size
+                // still reads as it did before the request, give the app one
+                // more settle before treating that size as a limit.
+                if actual == before[index].size, actual != requested {
+                    settle()
+                    guard let again = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
+                    actual = again
+                }
                 if let origin = pointAttribute(kAXPositionAttribute, from: windows[index].element) {
                     observed[index] = CGRect(origin: origin, size: actual)
                 }
@@ -203,7 +216,6 @@ final class WindowTiler {
                 // that back as a limit is exactly the cache poisoning the
                 // audit found.
                 guard confirmed.contains(index) else { continue }
-                let requested = layout.flexibleFrames[position].size
                 // A deviation within one grid cell is snapping and must not
                 // be recorded as a limit: a 12-point shortfall in a short
                 // tile would otherwise become a hard maximum that later
@@ -349,7 +361,12 @@ final class WindowTiler {
     /// loop instead of sleeping so the menu and hotkey stay responsive; the
     /// delegate's isTiling flag keeps a nested tile from starting meanwhile.
     private func settle() {
-        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.04))
+        let deadline = Date().addingTimeInterval(0.04)
+        // run(mode:before:) may return after a single event; keep going
+        // until the deadline so the apps really get their 40 ms.
+        while Date() < deadline {
+            RunLoop.main.run(mode: .default, before: deadline)
+        }
     }
 
     /// True when a window sits at its tile's origin and within its size
@@ -559,8 +576,7 @@ final class WindowTiler {
 
             let frame = CGRect(origin: position, size: size)
             let identity: String
-            var number: CGWindowID = 0
-            if windowServerID(element, &number) == .success, number != 0 {
+            if let number = windowNumber(of: element) {
                 if onScreen != nil {
                     guard let matchIndex = unclaimed?.firstIndex(where: { $0.number == Int(number) }) else { continue }
                     unclaimed?.remove(at: matchIndex)
@@ -628,6 +644,23 @@ final class WindowTiler {
         let status = AXUIElementIsAttributeSettable(element, name as CFString, &settable)
         if status == .cannotComplete { quarantine(element) }
         return status == .success && settable.boolValue
+    }
+
+    @discardableResult
+    private func setAttribute(_ name: String, to value: CFTypeRef, on element: AXUIElement) -> Bool {
+        guard !isQuarantined(element) else { return false }
+        let status = AXUIElementSetAttributeValue(element, name as CFString, value)
+        if status == .cannotComplete { quarantine(element) }
+        return status == .success
+    }
+
+    /// The window server id, or nil if the app did not answer.
+    private func windowNumber(of element: AXUIElement) -> CGWindowID? {
+        guard !isQuarantined(element) else { return nil }
+        var number: CGWindowID = 0
+        let status = windowServerID(element, &number)
+        if status == .cannotComplete { quarantine(element) }
+        return status == .success && number != 0 ? number : nil
     }
 
     private func attribute(_ name: String, from element: AXUIElement) -> AnyObject? {
