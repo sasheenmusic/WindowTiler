@@ -151,13 +151,17 @@ final class WindowTiler {
             for (position, index) in flexibleIndices.enumerated() where position < layout.flexibleFrames.count {
                 let requested = layout.flexibleFrames[position].size
                 guard let actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
-                var updated = limits[index]
-                if actual.width > requested.width + sizeTolerance { updated.minimum.width = max(updated.minimum.width, actual.width) }
-                if actual.height > requested.height + sizeTolerance { updated.minimum.height = max(updated.minimum.height, actual.height) }
-                if actual.width < requested.width - sizeTolerance { updated.maximum.width = min(updated.maximum.width, actual.width) }
-                if actual.height < requested.height - sizeTolerance { updated.maximum.height = min(updated.maximum.height, actual.height) }
-                updated = clamp(updated, to: screen)
+                // A deviation within one grid cell is snapping and must not
+                // be recorded as a limit: a 12-point shortfall in a short
+                // tile would otherwise become a hard maximum that later
+                // turns the window into a fixed-size block.
                 learnSnap(identity: windows[index].identity, requested: requested, actual: actual)
+                var updated = limits[index]
+                if actual.width > requested.width + boundedTolerance { updated.minimum.width = max(updated.minimum.width, actual.width) }
+                if actual.height > requested.height + boundedTolerance { updated.minimum.height = max(updated.minimum.height, actual.height) }
+                if actual.width < requested.width - boundedTolerance { updated.maximum.width = min(updated.maximum.width, actual.width) }
+                if actual.height < requested.height - boundedTolerance { updated.maximum.height = min(updated.maximum.height, actual.height) }
+                updated = clamp(updated, to: screen)
                 if updated.minimum != limits[index].minimum || updated.maximum != limits[index].maximum {
                     limits[index] = updated
                     learnedLimits[windows[index].identity] = updated
@@ -259,14 +263,15 @@ final class WindowTiler {
         snapAllowances = snapAllowances.filter { live.contains($0.key) }
     }
 
-    /// A shortfall of at most one grid cell is snapping. Remember the largest
-    /// shortfall seen on each axis; that is this window's wiggle room.
+    /// A deviation of at most one grid cell in either direction is snapping
+    /// (Terminal rounds to the nearest whole cell). Remember the largest seen
+    /// on each axis; that is this window's wiggle room.
     private func learnSnap(identity: String, requested: CGSize, actual: CGSize) {
-        let shortWidth = requested.width - actual.width
-        let shortHeight = requested.height - actual.height
+        let widthGap = abs(requested.width - actual.width)
+        let heightGap = abs(requested.height - actual.height)
         var allowance = snapAllowances[identity] ?? .zero
-        if shortWidth > sizeTolerance, shortWidth <= boundedTolerance { allowance.width = max(allowance.width, shortWidth) }
-        if shortHeight > sizeTolerance, shortHeight <= boundedTolerance { allowance.height = max(allowance.height, shortHeight) }
+        if widthGap > sizeTolerance, widthGap <= boundedTolerance { allowance.width = max(allowance.width, widthGap) }
+        if heightGap > sizeTolerance, heightGap <= boundedTolerance { allowance.height = max(allowance.height, heightGap) }
         if allowance != .zero { snapAllowances[identity] = allowance }
     }
 
@@ -295,14 +300,12 @@ final class WindowTiler {
         let widthGap = abs(actual.width - frame.width)
         let heightGap = abs(actual.height - frame.height)
         if widthGap <= sizeTolerance && heightGap <= sizeTolerance { return .tiled }
-        // A grid-snapped window lands a little short of its tile. Leave it
+        // A grid-snapped window lands within one cell of its tile. Leave it
         // at the tile's top-left corner, where it already is, so it does not
         // jump on every re-tile; the wiggle room stays at the bottom/right.
         let allowance = snapAllowance ?? CGSize(width: boundedTolerance, height: boundedTolerance)
-        let snapped = frame.width - actual.width <= max(allowance.width, sizeTolerance)
-            && frame.height - actual.height <= max(allowance.height, sizeTolerance)
-            && actual.width <= frame.width + sizeTolerance
-            && actual.height <= frame.height + sizeTolerance
+        let snapped = widthGap <= max(allowance.width, sizeTolerance)
+            && heightGap <= max(allowance.height, sizeTolerance)
         return snapped ? .tiled : centerConstrainedWindow(element, in: frame)
     }
 
