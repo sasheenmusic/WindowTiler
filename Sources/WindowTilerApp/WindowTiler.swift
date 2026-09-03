@@ -75,9 +75,10 @@ final class WindowTiler {
     /// Apps whose AXEnhancedUserInterface flag we switched off and could not
     /// switch back yet (they were quarantined mid-tile). Retried each tile.
     private var pendingEnhancedUIRestore = Set<pid_t>()
-    /// Unchanged sizes seen once after a request, by window identity. A
-    /// clamp is only believed once the same unchanged size shows up on a
-    /// second, separate attempt.
+    /// Unchanged sizes seen once after a request during the current tile,
+    /// by window identity. A clamp is only believed once a second, separate
+    /// attempt in the same tile shows the same unchanged size; the record
+    /// is consumed by that confirmation and never outlives the tile.
     private var pendingClamps: [String: CGSize] = [:]
     private let systemWideElement = AXUIElementCreateSystemWide()
     private let enhancedUserInterfaceAttribute = "AXEnhancedUserInterface"
@@ -111,8 +112,8 @@ final class WindowTiler {
         if relearn {
             learnedLimits.removeAll()
             snapAllowances.removeAll()
-            pendingClamps.removeAll()
         }
+        pendingClamps.removeAll()
 
         let screens = screenBoundsInAccessibilityCoordinates()
         guard !screens.isEmpty else { return .empty }
@@ -232,6 +233,7 @@ final class WindowTiler {
                         needsAnotherPass = true
                         continue
                     }
+                    pendingClamps[identity] = nil
                 } else {
                     pendingClamps[identity] = nil
                 }
@@ -418,7 +420,6 @@ final class WindowTiler {
         let expiry = Date().addingTimeInterval(-learnedLimitsLifetime)
         learnedLimits = learnedLimits.filter { live.contains($0.key) && $0.value.learnedAt > expiry }
         snapAllowances = snapAllowances.filter { live.contains($0.key) }
-        pendingClamps = pendingClamps.filter { live.contains($0.key) }
     }
 
     /// A deviation of at most one grid cell in either direction is snapping
@@ -516,10 +517,10 @@ final class WindowTiler {
             windowCenters: windows.map { ($0.identity, $0.center) },
             screens: screens
         )
-        // An app that is not answering keeps a stable placeholder so it does
-        // not look like its windows closed and reopened while it is skipped.
-        let skipped = quarantine.pids.map { "unresponsive:\($0)" }
-        return ([signature] + skipped).joined(separator: "|")
+        // While an app is not answering, its windows cannot be listed, so
+        // the true window set is unknown; report that rather than a change.
+        guard quarantine.pids.isEmpty else { return nil }
+        return signature
     }
 
     /// Nil if the window server's on-screen list cannot be read. Without it
@@ -528,16 +529,15 @@ final class WindowTiler {
     private func eligibleWindows() -> [Window]? {
         let ownPID = ProcessInfo.processInfo.processIdentifier
         guard let onScreen = onScreenWindowsByProcess() else { return nil }
-        let running = NSWorkspace.shared.runningApplications.filter {
-            $0.activationPolicy == .regular
-                && !$0.isTerminated
-                && !$0.isHidden
-                && $0.processIdentifier != ownPID
+        let alive = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && !$0.isTerminated && $0.processIdentifier != ownPID
         }
-        let livePIDs = Set(running.map(\.processIdentifier))
-        applicationElements = applicationElements.filter { livePIDs.contains($0.key) }
-        quarantine.forget(except: livePIDs)
-        pendingEnhancedUIRestore = pendingEnhancedUIRestore.filter { livePIDs.contains($0) }
+        // Per-app state outlives hiding; only a quit app is forgotten.
+        let alivePIDs = Set(alive.map(\.processIdentifier))
+        applicationElements = applicationElements.filter { alivePIDs.contains($0.key) }
+        quarantine.forget(except: alivePIDs)
+        pendingEnhancedUIRestore = pendingEnhancedUIRestore.filter { alivePIDs.contains($0) }
+        let running = alive.filter { !$0.isHidden }
 
         return running
             .flatMap { app -> [Window] in

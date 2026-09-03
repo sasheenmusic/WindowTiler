@@ -22,6 +22,7 @@ final class AppQuarantine {
 
     var pids: [pid_t] { until.filter { $0.value > Date() }.keys.sorted() }
 
+    /// Drops expired entries and apps that have quit.
     func forget(except live: Set<pid_t>) {
         until = until.filter { live.contains($0.key) && $0.value > Date() }
     }
