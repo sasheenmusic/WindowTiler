@@ -42,6 +42,12 @@ final class WindowTiler {
     /// (no separate shrink/grow probe), dropped when the window closes, and
     /// cleared on every manual tile so a changed layout is re-measured.
     private var learnedLimits: [String: SizeLimits] = [:]
+    /// How far short of a requested size a window lands because it snaps to
+    /// a grid (Terminal resizes in whole character cells, 8x16 points with a
+    /// typical font). Learned per window; a shortfall inside this allowance
+    /// is treated as a tiled window with a little wiggle room, not as a
+    /// bounded one.
+    private var snapAllowances: [String: CGSize] = [:]
     private var applicationElements: [pid_t: AXUIElement] = [:]
     private var unresponsiveUntil: [pid_t: Date] = [:]
     private let systemWideElement = AXUIElementCreateSystemWide()
@@ -53,10 +59,10 @@ final class WindowTiler {
     private let unresponsiveCooldown: TimeInterval = 5
     private let maximumPasses = 4
     private let sizeTolerance: CGFloat = 2
-    /// Terminal and some AppKit windows snap to a character/pixel grid and may
-    /// stop a few points short of the requested size. That is not a genuinely
-    /// fixed-size window and must not send the whole desktop into the
-    /// bounded-window mosaic fallback.
+    /// Largest grid step treated as snapping rather than a real size limit.
+    /// One character cell of a very large terminal font is about 16x32
+    /// points; anything beyond this is a genuinely bounded window and sends
+    /// the layout into the bounded-window mosaic.
     private let boundedTolerance: CGFloat = 32
 
     init() {
@@ -73,7 +79,10 @@ final class WindowTiler {
     ///   a new font size) is measured again.
     func tileAllWindows(relearn: Bool) -> TilingResult {
         guard isAccessibilityEnabled(prompt: false) else { return .empty }
-        if relearn { learnedLimits.removeAll() }
+        if relearn {
+            learnedLimits.removeAll()
+            snapAllowances.removeAll()
+        }
 
         let screens = screenBoundsInAccessibilityCoordinates()
         guard !screens.isEmpty else { return .empty }
@@ -148,6 +157,7 @@ final class WindowTiler {
                 if actual.width < requested.width - sizeTolerance { updated.maximum.width = min(updated.maximum.width, actual.width) }
                 if actual.height < requested.height - sizeTolerance { updated.maximum.height = min(updated.maximum.height, actual.height) }
                 updated = clamp(updated, to: screen)
+                learnSnap(identity: windows[index].identity, requested: requested, actual: actual)
                 if updated.minimum != limits[index].minimum || updated.maximum != limits[index].maximum {
                     limits[index] = updated
                     learnedLimits[windows[index].identity] = updated
@@ -158,7 +168,10 @@ final class WindowTiler {
         }
 
         summaries.append(contentsOf: windows.indices.map { index in
-            let state = bounded.contains(index) ? "bounded" : "flexible"
+            var state = bounded.contains(index) ? "bounded" : "flexible"
+            if let snap = snapAllowances[windows[index].identity] {
+                state += " snap \(Int(snap.width))x\(Int(snap.height))"
+            }
             return "\(windows[index].name): min \(Int(limits[index].minimum.width))x\(Int(limits[index].minimum.height)), max \(Int(limits[index].maximum.width))x\(Int(limits[index].maximum.height)), \(state)"
         })
 
@@ -179,7 +192,11 @@ final class WindowTiler {
                 failed += 1
                 continue
             }
-            switch finish(frame: layout.flexibleFrames[position], for: windows[index].element) {
+            switch finish(
+                frame: layout.flexibleFrames[position],
+                for: windows[index].element,
+                snapAllowance: snapAllowances[windows[index].identity]
+            ) {
             case .tiled: tiled += 1
             case .constrained: constrainedCount += 1
             case .failed: failed += 1
@@ -239,6 +256,18 @@ final class WindowTiler {
     private func pruneLearnedLimits(keeping identities: [String]) {
         let live = Set(identities)
         learnedLimits = learnedLimits.filter { live.contains($0.key) }
+        snapAllowances = snapAllowances.filter { live.contains($0.key) }
+    }
+
+    /// A shortfall of at most one grid cell is snapping. Remember the largest
+    /// shortfall seen on each axis; that is this window's wiggle room.
+    private func learnSnap(identity: String, requested: CGSize, actual: CGSize) {
+        let shortWidth = requested.width - actual.width
+        let shortHeight = requested.height - actual.height
+        var allowance = snapAllowances[identity] ?? .zero
+        if shortWidth > sizeTolerance, shortWidth <= boundedTolerance { allowance.width = max(allowance.width, shortWidth) }
+        if shortHeight > sizeTolerance, shortHeight <= boundedTolerance { allowance.height = max(allowance.height, shortHeight) }
+        if allowance != .zero { snapAllowances[identity] = allowance }
     }
 
     // MARK: - Applying frames
@@ -257,7 +286,7 @@ final class WindowTiler {
         return (firstMove == .success || finalMove == .success, resize == .success)
     }
 
-    private func finish(frame: CGRect, for element: AXUIElement) -> ApplyResult {
+    private func finish(frame: CGRect, for element: AXUIElement, snapAllowance: CGSize?) -> ApplyResult {
         let outcome = request(frame: frame, for: element)
         guard outcome.moved else { return .failed }
         guard outcome.resized, let actual = sizeAttribute(kAXSizeAttribute, from: element) else {
@@ -266,12 +295,15 @@ final class WindowTiler {
         let widthGap = abs(actual.width - frame.width)
         let heightGap = abs(actual.height - frame.height)
         if widthGap <= sizeTolerance && heightGap <= sizeTolerance { return .tiled }
-        // A grid-snapped window a few points short of its tile is still a
-        // tiled window; center the small difference instead of reporting it
-        // as bounded.
-        let snapped = widthGap <= boundedTolerance && heightGap <= boundedTolerance
-        let centered = centerConstrainedWindow(element, in: frame)
-        return snapped && centered == .constrained ? .tiled : centered
+        // A grid-snapped window lands a little short of its tile. Leave it
+        // at the tile's top-left corner, where it already is, so it does not
+        // jump on every re-tile; the wiggle room stays at the bottom/right.
+        let allowance = snapAllowance ?? CGSize(width: boundedTolerance, height: boundedTolerance)
+        let snapped = frame.width - actual.width <= max(allowance.width, sizeTolerance)
+            && frame.height - actual.height <= max(allowance.height, sizeTolerance)
+            && actual.width <= frame.width + sizeTolerance
+            && actual.height <= frame.height + sizeTolerance
+        return snapped ? .tiled : centerConstrainedWindow(element, in: frame)
     }
 
     private func applyBounded(frame: CGRect, to element: AXUIElement) -> Bool {
