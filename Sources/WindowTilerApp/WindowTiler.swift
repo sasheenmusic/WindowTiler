@@ -71,7 +71,14 @@ final class WindowTiler {
     /// bounded one.
     private var snapAllowances: [String: CGSize] = [:]
     private var applicationElements: [pid_t: AXUIElement] = [:]
-    private var unresponsiveUntil: [pid_t: Date] = [:]
+    private let quarantine = AppQuarantine.shared
+    /// Apps whose AXEnhancedUserInterface flag we switched off and could not
+    /// switch back yet (they were quarantined mid-tile). Retried each tile.
+    private var pendingEnhancedUIRestore = Set<pid_t>()
+    /// Unchanged sizes seen once after a request, by window identity. A
+    /// clamp is only believed once the same unchanged size shows up on a
+    /// second, separate attempt.
+    private var pendingClamps: [String: CGSize] = [:]
     private let systemWideElement = AXUIElementCreateSystemWide()
     private let enhancedUserInterfaceAttribute = "AXEnhancedUserInterface"
 
@@ -79,7 +86,6 @@ final class WindowTiler {
     /// request. The default is six seconds per request, which lets one hung
     /// app freeze the tiler.
     private let messagingTimeout: Float = 1.0
-    private let unresponsiveCooldown: TimeInterval = 5
     private let maximumPasses = 4
     private let sizeTolerance: CGFloat = 2
     /// Largest grid step treated as snapping rather than a real size limit.
@@ -105,12 +111,16 @@ final class WindowTiler {
         if relearn {
             learnedLimits.removeAll()
             snapAllowances.removeAll()
+            pendingClamps.removeAll()
         }
 
         let screens = screenBoundsInAccessibilityCoordinates()
         guard !screens.isEmpty else { return .empty }
 
-        let windows = eligibleWindows()
+        guard let windows = eligibleWindows() else {
+            Log.tiling.error("The window server's on-screen list is unavailable; not tiling")
+            return .empty
+        }
         pruneLearnedLimits(keeping: windows.map(\.identity))
 
         var grouped = Array(repeating: [Window](), count: screens.count)
@@ -122,8 +132,9 @@ final class WindowTiler {
             grouped[screenIndex].append(window)
         }
 
-        let enhancedUIApps = disableEnhancedUserInterface(for: Set(windows.map(\.pid)))
-        defer { restoreEnhancedUserInterface(for: enhancedUIApps) }
+        restoreEnhancedUserInterface()
+        pendingEnhancedUIRestore.formUnion(disableEnhancedUserInterface(for: Set(windows.map(\.pid))))
+        defer { restoreEnhancedUserInterface() }
 
         var tiled = 0
         var constrained = 0
@@ -150,12 +161,13 @@ final class WindowTiler {
         }
     }
 
-    /// Skips an app that was quarantined while tiling; the flag is restored
-    /// on the next tile once the app answers again, since disabling it is
-    /// only ever attempted after a successful read.
-    private func restoreEnhancedUserInterface(for pids: [pid_t]) {
-        for pid in pids where !isQuarantined(pid) {
-            setAttribute(enhancedUserInterfaceAttribute, to: kCFBooleanTrue, on: applicationElement(for: pid))
+    /// An app quarantined while tiling keeps its pending restoration and is
+    /// retried at the start and end of every later tile.
+    private func restoreEnhancedUserInterface() {
+        for pid in pendingEnhancedUIRestore where !isQuarantined(pid) {
+            if setAttribute(enhancedUserInterfaceAttribute, to: kCFBooleanTrue, on: applicationElement(for: pid)) {
+                pendingEnhancedUIRestore.remove(pid)
+            }
         }
     }
 
@@ -192,22 +204,15 @@ final class WindowTiler {
                 flexibleIndices: flexibleIndices, observed: observed
             )
             learnedOnLastPass = false
+            var needsAnotherPass = false
             guard !confirmed.isEmpty else { break }
             let before = observed
             settle()
 
             for (position, index) in flexibleIndices.enumerated()
             where position < layout.flexibleFrames.count && !isQuarantined(windows[index].pid) {
-                guard var actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
+                guard let actual = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
                 let requested = layout.flexibleFrames[position].size
-                // An accepted request only means the app took it. If the size
-                // still reads as it did before the request, give the app one
-                // more settle before treating that size as a limit.
-                if actual == before[index].size, actual != requested {
-                    settle()
-                    guard let again = sizeAttribute(kAXSizeAttribute, from: windows[index].element) else { continue }
-                    actual = again
-                }
                 if let origin = pointAttribute(kAXPositionAttribute, from: windows[index].element) {
                     observed[index] = CGRect(origin: origin, size: actual)
                 }
@@ -216,6 +221,20 @@ final class WindowTiler {
                 // that back as a limit is exactly the cache poisoning the
                 // audit found.
                 guard confirmed.contains(index) else { continue }
+                // An accepted request only means the app took it. A size that
+                // did not change at all is believed as a clamp only when a
+                // second, separate attempt shows the same unchanged size; a
+                // busy or still-opening window never teaches a limit.
+                let identity = windows[index].identity
+                if actual == before[index].size, actual != requested {
+                    if pendingClamps[identity] != actual {
+                        pendingClamps[identity] = actual
+                        needsAnotherPass = true
+                        continue
+                    }
+                } else {
+                    pendingClamps[identity] = nil
+                }
                 // A deviation within one grid cell is snapping and must not
                 // be recorded as a limit: a 12-point shortfall in a short
                 // tile would otherwise become a hard maximum that later
@@ -234,7 +253,7 @@ final class WindowTiler {
                     learnedOnLastPass = true
                 }
             }
-            if !learnedOnLastPass { break }
+            if !learnedOnLastPass && !needsAnotherPass { break }
         }
         if learnedOnLastPass {
             // The last pass taught us something; lay out once more so the
@@ -381,13 +400,15 @@ final class WindowTiler {
 
     /// Learned limits combined with this screen's bounds.
     private func effectiveLimits(_ learned: LearnedLimits, on screen: CGRect) -> SizeLimits {
-        let minimum = CGSize(
-            width: min(max(TilingLimits.minimumTileSize.width, learned.minimum.width), screen.width),
-            height: min(max(TilingLimits.minimumTileSize.height, learned.minimum.height), screen.height)
-        )
         let maximum = CGSize(
-            width: max(minimum.width, min(screen.width, learned.maximum.width)),
-            height: max(minimum.height, min(screen.height, learned.maximum.height))
+            width: min(screen.width, learned.maximum.width),
+            height: min(screen.height, learned.maximum.height)
+        )
+        // A window observed to be smaller than the usual minimum tile keeps
+        // that true size, so the layout reserves exactly what it occupies.
+        let minimum = CGSize(
+            width: min(max(TilingLimits.minimumTileSize.width, learned.minimum.width), maximum.width),
+            height: min(max(TilingLimits.minimumTileSize.height, learned.minimum.height), maximum.height)
         )
         return SizeLimits(minimum: minimum, maximum: maximum)
     }
@@ -397,6 +418,7 @@ final class WindowTiler {
         let expiry = Date().addingTimeInterval(-learnedLimitsLifetime)
         learnedLimits = learnedLimits.filter { live.contains($0.key) && $0.value.learnedAt > expiry }
         snapAllowances = snapAllowances.filter { live.contains($0.key) }
+        pendingClamps = pendingClamps.filter { live.contains($0.key) }
     }
 
     /// A deviation of at most one grid cell in either direction is snapping
@@ -457,8 +479,11 @@ final class WindowTiler {
 
     private func applyBounded(frame: CGRect, to element: AXUIElement) -> Bool {
         let outcome = request(frame: frame, for: element)
-        guard outcome.moved, !isQuarantined(element) else { return false }
-        return outcome.resized || !isAttributeSettable(kAXSizeAttribute, on: element)
+        guard outcome.moved, !isQuarantined(element),
+              let actual = sizeAttribute(kAXSizeAttribute, from: element) else { return false }
+        // The frame is the window's own size, so it must land within tolerance.
+        return abs(actual.width - frame.width) <= sizeTolerance
+            && abs(actual.height - frame.height) <= sizeTolerance
     }
 
     /// Some apps accept a resize request but clamp it to a fixed or minimum
@@ -482,21 +507,27 @@ final class WindowTiler {
 
     /// Ignores window position and size so our own tiling does not trigger a
     /// loop, but changes when a visible window opens, closes, or minimizes.
-    func windowTopologySignature() -> String {
+    /// Nil when the visible-window list is unavailable, so the caller can
+    /// treat the state as unknown instead of as a change.
+    func windowTopologySignature() -> String? {
         let screens = screenBoundsInAccessibilityCoordinates()
+        guard let windows = eligibleWindows() else { return nil }
         let signature = ScreenGeometryEngine.topologySignature(
-            windowCenters: eligibleWindows().map { ($0.identity, $0.center) },
+            windowCenters: windows.map { ($0.identity, $0.center) },
             screens: screens
         )
         // An app that is not answering keeps a stable placeholder so it does
         // not look like its windows closed and reopened while it is skipped.
-        let skipped = unresponsiveUntil.keys.sorted().map { "unresponsive:\($0)" }
+        let skipped = quarantine.pids.map { "unresponsive:\($0)" }
         return ([signature] + skipped).joined(separator: "|")
     }
 
-    private func eligibleWindows() -> [Window] {
+    /// Nil if the window server's on-screen list cannot be read. Without it
+    /// a window's Space cannot be established, and tiling windows from other
+    /// Spaces is exactly the bug the list guards against.
+    private func eligibleWindows() -> [Window]? {
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        let onScreen = onScreenWindowsByProcess()
+        guard let onScreen = onScreenWindowsByProcess() else { return nil }
         let running = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular
                 && !$0.isTerminated
@@ -505,19 +536,19 @@ final class WindowTiler {
         }
         let livePIDs = Set(running.map(\.processIdentifier))
         applicationElements = applicationElements.filter { livePIDs.contains($0.key) }
-        unresponsiveUntil = unresponsiveUntil.filter { livePIDs.contains($0.key) && $0.value > Date() }
+        quarantine.forget(except: livePIDs)
+        pendingEnhancedUIRestore = pendingEnhancedUIRestore.filter { livePIDs.contains($0) }
 
         return running
             .flatMap { app -> [Window] in
                 // The Accessibility window list contains windows on every
                 // Space. Only windows the system currently draws on screen
-                // take part in the layout; if the on-screen list is not
-                // available, fall back to accepting every window.
+                // take part in the layout.
                 windows(
                     for: app.processIdentifier,
                     appName: app.localizedName ?? app.bundleIdentifier ?? "App",
                     bundleIdentifier: app.bundleIdentifier,
-                    onScreen: onScreen.map { $0[app.processIdentifier] ?? [] }
+                    onScreen: onScreen[app.processIdentifier] ?? []
                 )
             }
             .sorted { $0.identity < $1.identity }
@@ -535,7 +566,7 @@ final class WindowTiler {
         for pid: pid_t,
         appName: String,
         bundleIdentifier: String?,
-        onScreen: [OnScreenWindow]?
+        onScreen: [OnScreenWindow]
     ) -> [Window] {
         guard !isQuarantined(pid) else { return [] }
         let app = applicationElement(for: pid)
@@ -577,18 +608,13 @@ final class WindowTiler {
             let frame = CGRect(origin: position, size: size)
             let identity: String
             if let number = windowNumber(of: element) {
-                if onScreen != nil {
-                    guard let matchIndex = unclaimed?.firstIndex(where: { $0.number == Int(number) }) else { continue }
-                    unclaimed?.remove(at: matchIndex)
-                }
+                guard let matchIndex = unclaimed.firstIndex(where: { $0.number == Int(number) }) else { continue }
+                unclaimed.remove(at: matchIndex)
                 identity = "\(pid):w\(number)"
-            } else if onScreen != nil {
-                // Fallback for the rare window with no id: match by frame.
-                guard let matchIndex = unclaimed?.firstIndex(where: { matches($0.bounds, frame) }),
-                      let match = unclaimed?.remove(at: matchIndex) else { continue }
-                identity = "\(pid):w\(match.number)"
             } else {
-                identity = "\(pid):h\(CFHash(element))"
+                // Fallback for the rare window with no id: match by frame.
+                guard let matchIndex = unclaimed.firstIndex(where: { matches($0.bounds, frame) }) else { continue }
+                identity = "\(pid):w\(unclaimed.remove(at: matchIndex).number)"
             }
             let window = Window(
                 element: element,
@@ -678,9 +704,8 @@ final class WindowTiler {
     /// thread, so the first one is enough to leave the app alone for a while.
     private func quarantine(_ element: AXUIElement) {
         var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success, !isQuarantined(pid) else { return }
-        unresponsiveUntil[pid] = Date().addingTimeInterval(unresponsiveCooldown)
-        Log.tiling.warning("pid \(pid) did not answer within \(self.messagingTimeout) s; skipping it for \(self.unresponsiveCooldown) s")
+        guard AXUIElementGetPid(element, &pid) == .success else { return }
+        quarantine.add(pid)
     }
 
     private func isQuarantined(_ element: AXUIElement) -> Bool {
@@ -689,8 +714,7 @@ final class WindowTiler {
     }
 
     private func isQuarantined(_ pid: pid_t) -> Bool {
-        guard let until = unresponsiveUntil[pid] else { return false }
-        return until > Date()
+        quarantine.contains(pid)
     }
 
     private func pointAttribute(_ name: String, from element: AXUIElement) -> CGPoint? {

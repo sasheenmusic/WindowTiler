@@ -6,10 +6,8 @@ import ApplicationServices
 /// system for launches, quits, hides, Space switches, and display changes.
 final class WindowEventMonitor {
     private var observers: [pid_t: AXObserver] = [:]
-    /// Apps whose attachment timed out; not retried before this date.
-    private var retryAfter: [pid_t: Date] = [:]
+    private let quarantine = AppQuarantine.shared
     private let messagingTimeout: Float = 1.0
-    private let attachCooldown: TimeInterval = 5
     private var workspaceTokens: [NSObjectProtocol] = []
     private let onChange: () -> Void
 
@@ -68,8 +66,7 @@ final class WindowEventMonitor {
             detach(observer)
             observers[pid] = nil
         }
-        retryAfter = retryAfter.filter { livePIDs.contains($0.key) && $0.value > Date() }
-        for pid in livePIDs where observers[pid] == nil && retryAfter[pid] == nil {
+        for pid in livePIDs where observers[pid] == nil && !quarantine.contains(pid) {
             attach(pid: pid)
         }
     }
@@ -81,8 +78,13 @@ final class WindowEventMonitor {
             let monitor = Unmanaged<WindowEventMonitor>.fromOpaque(refcon).takeUnretainedValue()
             if notification as String == kAXWindowCreatedNotification {
                 // Destruction is only reported reliably when it was requested
-                // on the window itself, so watch each new window directly.
-                monitor.watchWindow(element, with: observer)
+                // on the window itself, so watch each new window directly. If
+                // that fails, the whole attachment is redone by the next
+                // refresh so the close is not missed.
+                let result = monitor.watchWindow(element, with: observer)
+                if result != .success, let pid = monitor.observers.first(where: { $0.value == observer })?.key {
+                    monitor.invalidate(observer, for: pid, timedOut: result == .timedOut)
+                }
             }
             monitor.onChange()
         }
@@ -99,7 +101,7 @@ final class WindowEventMonitor {
         for name in Self.applicationNotifications {
             let status = AXObserverAddNotification(observer, app, name as CFString, refcon)
             if status == .cannotComplete {
-                retryAfter[pid] = Date().addingTimeInterval(attachCooldown)
+                quarantine.add(pid)
                 return
             }
             // A notification the app simply does not support is not a failure.
@@ -108,7 +110,7 @@ final class WindowEventMonitor {
         var value: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
         if status == .cannotComplete {
-            retryAfter[pid] = Date().addingTimeInterval(attachCooldown)
+            quarantine.add(pid)
             return
         }
         guard status == .success, let windows = value as? [AXUIElement] else { return }
@@ -116,13 +118,19 @@ final class WindowEventMonitor {
             switch watchWindow(window, with: observer) {
             case .success: continue
             case .timedOut:
-                retryAfter[pid] = Date().addingTimeInterval(attachCooldown)
+                quarantine.add(pid)
                 return
             case .failed: return
             }
         }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         observers[pid] = observer
+    }
+
+    private func invalidate(_ observer: AXObserver, for pid: pid_t, timedOut: Bool) {
+        detach(observer)
+        observers[pid] = nil
+        if timedOut { quarantine.add(pid) }
     }
 
     private enum WatchResult { case success, timedOut, failed }

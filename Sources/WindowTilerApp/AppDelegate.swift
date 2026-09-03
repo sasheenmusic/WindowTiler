@@ -182,8 +182,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               !isTiling,
               NSApp.modalWindow == nil,
               tiler.isAccessibilityEnabled(prompt: false) else { return }
-        let topology = tiler.windowTopologySignature()
-        guard topology != lastTopology else { return }
+        // A nil signature means the state is unknown, not changed.
+        guard let topology = tiler.windowTopologySignature(), topology != lastTopology else { return }
         Log.tiling.notice("Visible window set changed. Was: \(self.lastTopology ?? "none", privacy: .public) Now: \(topology, privacy: .public)")
         lastTopology = topology
         performTile(showFeedback: false, relearn: false, reason: "visible window set changed")
