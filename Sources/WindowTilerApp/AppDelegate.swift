@@ -21,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let autoRetileDefaultsKey = "autoRetile"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSLog("Window Tiler launched")
+        Log.app.notice("Window Tiler launched")
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "diagnostics.lastLaunchAt")
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -96,11 +96,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(registered, forKey: "diagnostics.hotKeyRegistered")
         shortcutItems.enumerated().forEach { $0.element.state = $0.offset == index && registered ? .on : .off }
         if registered {
-            NSLog("Window Tiler registered shortcut %@", HotKeyChoice.choices[index].title)
+            Log.app.notice("Registered shortcut \(HotKeyChoice.choices[index].title, privacy: .public)")
             UserDefaults.standard.set(index, forKey: shortcutDefaultsKey)
             statusItem.button?.toolTip = "Window Tiler — \(HotKeyChoice.choices[index].title)"
         } else {
-            NSLog("Window Tiler could not register shortcut %@", HotKeyChoice.choices[index].title)
+            Log.app.error("Could not register shortcut \(HotKeyChoice.choices[index].title, privacy: .public)")
             statusItem.button?.toolTip = "Window Tiler — no shortcut registered"
             if interactive {
                 showAlert(title: "Shortcut unavailable", message: "Another app is already using that shortcut. Choose a different one from the Window Tiler menu.")
@@ -133,14 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "lastFailedCount": result.failed,
             "lastTileDurationMilliseconds": durationMilliseconds,
         ] as [String: Any], forKey: "diagnostics.lastTile")
-        NSLog(
-            "Window Tiler [%@]: tiled %d, fixed-size %d, failed %d in %d ms",
-            reason,
-            result.tiled,
-            result.constrained,
-            result.failed,
-            durationMilliseconds
-        )
+        Log.tiling.notice("[\(reason, privacy: .public)] tiled \(result.tiled) fixed-size \(result.constrained) failed \(result.failed) in \(durationMilliseconds) ms")
         if showFeedback && result.tiled == 0 && result.constrained == 0 {
             showAlert(title: "No windows tiled", message: "No normal app windows were available to move.")
         } else if showFeedback && (result.constrained > 0 || result.failed > 0) {
@@ -192,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               tiler.isAccessibilityEnabled(prompt: false) else { return }
         let topology = tiler.windowTopologySignature()
         guard topology != lastTopology else { return }
-        NSLog("Window Tiler detected a visible window-set change")
+        Log.tiling.notice("Visible window set changed. Was: \(self.lastTopology ?? "none", privacy: .public) Now: \(topology, privacy: .public)")
         lastTopology = topology
         performTile(showFeedback: false, relearn: false, reason: "visible window set changed")
     }

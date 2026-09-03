@@ -49,8 +49,8 @@ final class WindowTiler {
     /// Seconds to wait for another app before giving up on an Accessibility
     /// request. The default is six seconds per request, which lets one hung
     /// app freeze the tiler.
-    private let messagingTimeout: Float = 0.5
-    private let unresponsiveCooldown: TimeInterval = 10
+    private let messagingTimeout: Float = 1.0
+    private let unresponsiveCooldown: TimeInterval = 5
     private let maximumPasses = 4
     private let sizeTolerance: CGFloat = 2
     /// Terminal and some AppKit windows snap to a character/pixel grid and may
@@ -301,10 +301,14 @@ final class WindowTiler {
     /// loop, but changes when a visible window opens, closes, or minimizes.
     func windowTopologySignature() -> String {
         let screens = screenBoundsInAccessibilityCoordinates()
-        return ScreenGeometryEngine.topologySignature(
+        let signature = ScreenGeometryEngine.topologySignature(
             windowCenters: eligibleWindows().map { ($0.identity, $0.center) },
             screens: screens
         )
+        // An app that is not answering keeps a stable placeholder so it does
+        // not look like its windows closed and reopened while it is skipped.
+        let skipped = unresponsiveUntil.keys.sorted().map { "unresponsive:\($0)" }
+        return ([signature] + skipped).joined(separator: "|")
     }
 
     private func eligibleWindows() -> [Window] {
@@ -358,6 +362,7 @@ final class WindowTiler {
             // The app did not answer within the messaging timeout. Leave it
             // alone for a while instead of stalling on every request.
             unresponsiveUntil[pid] = Date().addingTimeInterval(unresponsiveCooldown)
+            Log.tiling.warning("\(appName, privacy: .public) (pid \(pid)) did not answer within \(self.messagingTimeout) s; skipping it for \(self.unresponsiveCooldown) s")
             return []
         }
         guard status == .success, let elements = value as? [AXUIElement] else { return [] }
