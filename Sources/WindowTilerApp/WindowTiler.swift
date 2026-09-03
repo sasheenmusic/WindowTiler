@@ -534,8 +534,12 @@ final class WindowTiler {
             let isStandard = subrole == kAXStandardWindowSubrole
             let isDialog = subrole == kAXDialogSubrole
             guard isStandard || isDialog else { continue }
+            // Open and Save panels report themselves as standard windows and
+            // are not modal, but the shared panel service labels them.
+            if let identifier = attribute(kAXIdentifierAttribute, from: element) as? String,
+               identifier == "open-panel" || identifier == "save-panel" { continue }
             if isStandard { hasStandardWindow = true }
-            // Open and Save panels and other modal dialogs are never tiled.
+            // Other modal dialogs (alerts, sheets shown as windows) are never tiled.
             if isDialog, (attribute(kAXModalAttribute, from: element) as? Bool) == true { continue }
             let title = attribute(kAXTitleAttribute, from: element) as? String
             guard (attribute(kAXRoleAttribute, from: element) as? String) == kAXWindowRole,
