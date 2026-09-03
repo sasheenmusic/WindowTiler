@@ -85,30 +85,32 @@ final class WindowEventMonitor {
 
         let app = AXUIElementCreateApplication(pid)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        var registered = false
+        // An app that is still starting up may refuse registrations or its
+        // window list. Nothing is recorded unless every required step
+        // succeeds, so the next refresh tries the whole attachment again.
+        var complete = true
         for name in Self.applicationNotifications {
             let status = AXObserverAddNotification(observer, app, name as CFString, refcon)
-            if status == .success || status == .notificationAlreadyRegistered {
-                registered = true
+            // A notification the app simply does not support is not a failure.
+            if status != .success && status != .notificationAlreadyRegistered && status != .notificationUnsupported {
+                complete = false
             }
         }
-        // An app that is still starting up may refuse every notification.
-        // Leaving it unregistered lets the next refresh try again.
-        guard registered else { return }
+        var value: CFTypeRef?
+        guard complete,
+              AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement],
+              windows.allSatisfy({ watchWindow($0, with: observer) }) else { return }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         observers[pid] = observer
-
-        var value: CFTypeRef?
-        if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-           let windows = value as? [AXUIElement] {
-            windows.forEach { watchWindow($0, with: observer) }
-        }
     }
 
-    private func watchWindow(_ window: AXUIElement, with observer: AXObserver) {
+    @discardableResult
+    private func watchWindow(_ window: AXUIElement, with observer: AXObserver) -> Bool {
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        for name in Self.windowNotifications {
-            AXObserverAddNotification(observer, window, name as CFString, refcon)
+        return Self.windowNotifications.allSatisfy { name in
+            let status = AXObserverAddNotification(observer, window, name as CFString, refcon)
+            return status == .success || status == .notificationAlreadyRegistered || status == .notificationUnsupported
         }
     }
 

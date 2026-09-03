@@ -402,7 +402,8 @@ final class WindowTiler {
     private func request(frame: CGRect, for element: AXUIElement) -> (moved: Bool, resized: Bool) {
         var position = frame.origin
         var size = frame.size
-        guard let positionValue = AXValueCreate(.cgPoint, &position),
+        guard !isQuarantined(element),
+              let positionValue = AXValueCreate(.cgPoint, &position),
               let sizeValue = AXValueCreate(.cgSize, &size) else { return (false, false) }
         let firstMove = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, positionValue)
         if firstMove == .cannotComplete {
@@ -439,7 +440,8 @@ final class WindowTiler {
 
     private func applyBounded(frame: CGRect, to element: AXUIElement) -> Bool {
         let outcome = request(frame: frame, for: element)
-        return outcome.moved && (outcome.resized || !isAttributeSettable(kAXSizeAttribute, on: element))
+        guard outcome.moved, !isQuarantined(element) else { return false }
+        return outcome.resized || !isAttributeSettable(kAXSizeAttribute, on: element)
     }
 
     /// Some apps accept a resize request but clamp it to a fixed or minimum
@@ -447,15 +449,16 @@ final class WindowTiler {
     /// their actual native size in the equal tile instead of leaving them at
     /// an arbitrary position.
     private func centerConstrainedWindow(_ element: AXUIElement, in frame: CGRect) -> ApplyResult {
-        guard let actualSize = sizeAttribute(kAXSizeAttribute, from: element) else { return .failed }
+        guard let actualSize = sizeAttribute(kAXSizeAttribute, from: element),
+              !isQuarantined(element) else { return .failed }
         var centered = CGPoint(
             x: frame.midX - actualSize.width / 2,
             y: frame.midY - actualSize.height / 2
         )
         guard let centeredValue = AXValueCreate(.cgPoint, &centered) else { return .failed }
-        return AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, centeredValue) == .success
-            ? .constrained
-            : .failed
+        let status = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, centeredValue)
+        if status == .cannotComplete { quarantine(element) }
+        return status == .success ? .constrained : .failed
     }
 
     // MARK: - Discovering windows
@@ -558,7 +561,10 @@ final class WindowTiler {
             let identity: String
             var number: CGWindowID = 0
             if windowServerID(element, &number) == .success, number != 0 {
-                if onScreen != nil, !(onScreen!.contains { $0.number == Int(number) }) { continue }
+                if onScreen != nil {
+                    guard let matchIndex = unclaimed?.firstIndex(where: { $0.number == Int(number) }) else { continue }
+                    unclaimed?.remove(at: matchIndex)
+                }
                 identity = "\(pid):w\(number)"
             } else if onScreen != nil {
                 // Fallback for the rare window with no id: match by frame.
@@ -612,13 +618,20 @@ final class WindowTiler {
 
     // MARK: - Accessibility helpers
 
+    // Every helper below refuses to talk to a quarantined app, so one
+    // timed-out request is the last one that app receives for a while, no
+    // matter which code path asks.
+
     private func isAttributeSettable(_ name: String, on element: AXUIElement) -> Bool {
+        guard !isQuarantined(element) else { return false }
         var settable = DarwinBoolean(false)
-        return AXUIElementIsAttributeSettable(element, name as CFString, &settable) == .success
-            && settable.boolValue
+        let status = AXUIElementIsAttributeSettable(element, name as CFString, &settable)
+        if status == .cannotComplete { quarantine(element) }
+        return status == .success && settable.boolValue
     }
 
     private func attribute(_ name: String, from element: AXUIElement) -> AnyObject? {
+        guard !isQuarantined(element) else { return nil }
         var value: CFTypeRef?
         let status = AXUIElementCopyAttributeValue(element, name as CFString, &value)
         guard status == .success else {
