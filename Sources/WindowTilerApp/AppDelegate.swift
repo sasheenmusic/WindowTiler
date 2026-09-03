@@ -124,7 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let started = CFAbsoluteTimeGetCurrent()
         let result = tiler.tileAllWindows(relearn: relearn)
         let durationMilliseconds = Int((CFAbsoluteTimeGetCurrent() - started) * 1_000)
-        lastTopology = tiler.windowTopologySignature()
+        rememberTopology()
         // Lightweight signal for the live test harness (no disk writes).
         DistributedNotificationCenter.default().postNotificationName(
             Notification.Name("com.windowtiler.app.didTile"),
@@ -151,14 +151,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let enabled = !isAutoRetileEnabled
         UserDefaults.standard.set(enabled, forKey: autoRetileDefaultsKey)
         autoRetileItem.state = enabled ? .on : .off
-        lastTopology = tiler.windowTopologySignature()
+        rememberTopology()
         if enabled { performTile(showFeedback: false, relearn: false, reason: "automatic re-tiling enabled") }
     }
 
     // MARK: - Watching for window changes
 
+    /// Records the current window set as the baseline. An unknown set (an
+    /// app is not answering) never replaces a known one.
+    private func rememberTopology() {
+        if let topology = tiler.windowTopologySignature() {
+            lastTopology = topology
+        }
+    }
+
     private func startWindowMonitor() {
-        lastTopology = tiler.windowTopologySignature()
+        rememberTopology()
         eventMonitor = WindowEventMonitor { [weak self] in self?.windowsMayHaveChanged() }
         safetyNetTimer = Timer.scheduledTimer(withTimeInterval: safetyNetInterval, repeats: true) { [weak self] _ in
             self?.eventMonitor?.refresh()
@@ -182,8 +190,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               !isTiling,
               NSApp.modalWindow == nil,
               tiler.isAccessibilityEnabled(prompt: false) else { return }
-        // A nil signature means the state is unknown, not changed.
-        guard let topology = tiler.windowTopologySignature(), topology != lastTopology else { return }
+        // A nil signature means the state is unknown, not changed. Without a
+        // baseline yet, this signature becomes the baseline; nothing is tiled.
+        guard let topology = tiler.windowTopologySignature() else { return }
+        guard let known = lastTopology else {
+            lastTopology = topology
+            return
+        }
+        guard topology != known else { return }
         Log.tiling.notice("Visible window set changed. Was: \(self.lastTopology ?? "none", privacy: .public) Now: \(topology, privacy: .public)")
         lastTopology = topology
         performTile(showFeedback: false, relearn: false, reason: "visible window set changed")
