@@ -11,6 +11,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var safetyNetTimer: Timer?
     private var lastTopology: String?
     private var isTiling = false
+    /// Set by a Space switch: tile on the next check even if the window
+    /// count signature did not change (another Space can hold the same
+    /// number of windows of the same apps).
+    private var tileRequested = false
     /// Window events arrive in bursts (an app opening three windows, a Space
     /// switch). Wait for them to stop before reading the window list once.
     private let settleTime: TimeInterval = 0.25
@@ -167,7 +171,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startWindowMonitor() {
         rememberTopology()
-        eventMonitor = WindowEventMonitor { [weak self] in self?.windowsMayHaveChanged() }
+        eventMonitor = WindowEventMonitor(
+            onChange: { [weak self] in self?.windowsMayHaveChanged() },
+            onSpaceChange: { [weak self] in
+                self?.tileRequested = true
+                self?.windowsMayHaveChanged()
+            }
+        )
         safetyNetTimer = Timer.scheduledTimer(withTimeInterval: safetyNetInterval, repeats: true) { [weak self] _ in
             self?.eventMonitor?.refresh()
             self?.checkForWindowChanges()
@@ -197,8 +207,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastTopology = topology
             return
         }
+        if tileRequested {
+            tileRequested = false
+            lastTopology = topology
+            performTile(showFeedback: false, relearn: false, reason: "space changed")
+            return
+        }
         guard topology != known else { return }
-        Log.tiling.notice("Visible window set changed. Was: \(self.lastTopology ?? "none", privacy: .public) Now: \(topology, privacy: .public)")
+        Log.tiling.notice("Visible window set changed. Was: \(known, privacy: .public) Now: \(topology, privacy: .public)")
         lastTopology = topology
         performTile(showFeedback: false, relearn: false, reason: "visible window set changed")
     }

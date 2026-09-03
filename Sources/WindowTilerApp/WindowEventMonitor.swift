@@ -10,6 +10,7 @@ final class WindowEventMonitor {
     private let messagingTimeout: Float = 1.0
     private var workspaceTokens: [NSObjectProtocol] = []
     private let onChange: () -> Void
+    private let onSpaceChange: () -> Void
 
     /// Registered on the application element; these fire for any window.
     private static let applicationNotifications: [String] = [
@@ -24,15 +25,19 @@ final class WindowEventMonitor {
         kAXUIElementDestroyedNotification,
     ]
 
-    init(onChange: @escaping () -> Void) {
+    /// - Parameters:
+    ///   - onChange: the visible window set may have changed.
+    ///   - onSpaceChange: the user switched Spaces; the windows now on
+    ///     screen need tiling even if their count matches the old Space.
+    init(onChange: @escaping () -> Void, onSpaceChange: @escaping () -> Void) {
         self.onChange = onChange
+        self.onSpaceChange = onSpaceChange
         let workspace = NSWorkspace.shared.notificationCenter
         let workspaceNames: [Notification.Name] = [
             NSWorkspace.didLaunchApplicationNotification,
             NSWorkspace.didTerminateApplicationNotification,
             NSWorkspace.didHideApplicationNotification,
             NSWorkspace.didUnhideApplicationNotification,
-            NSWorkspace.activeSpaceDidChangeNotification,
         ]
         workspaceTokens = workspaceNames.map { name in
             workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -40,6 +45,12 @@ final class WindowEventMonitor {
                 self?.onChange()
             }
         }
+        workspaceTokens.append(workspace.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refresh()
+            self?.onSpaceChange()
+        })
         workspaceTokens.append(NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
