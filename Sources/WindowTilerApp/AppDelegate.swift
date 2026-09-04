@@ -1,4 +1,5 @@
 import AppKit
+import WindowTilerCore
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tiler = WindowTiler()
@@ -7,6 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventMonitor: WindowEventMonitor?
     private var shortcutItems: [NSMenuItem] = []
     private var autoRetileItem: NSMenuItem!
+    private let layoutPanel = LayoutPanel()
+    /// A layout the user picked in the panel. Active only while automatic
+    /// re-tiling is off; ends by itself when the visible window set changes.
+    private var handPickedPlan: RowPlan?
     private var settleTimer: Timer?
     private var safetyNetTimer: Timer?
     private var lastTopology: String?
@@ -31,6 +36,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "rectangle.grid.2x2", accessibilityDescription: "Window Tiler")
         hotKeyManager = HotKeyManager { [weak self] in self?.tileWindows() }
+        layoutPanel.onApply = { [weak self] plan in self?.applyHandPickedPlan(plan) }
+        layoutPanel.onAutomatic = { [weak self] in self?.chooseAutomaticLayout() }
         buildMenu()
         selectShortcut(index: savedShortcutIndex(), interactive: false)
 
@@ -52,6 +59,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoRetileItem.target = self
         autoRetileItem.state = isAutoRetileEnabled ? .on : .off
         menu.addItem(autoRetileItem)
+
+        let layoutItem = NSMenuItem(title: "Choose Layout…", action: #selector(openLayoutPanel), keyEquivalent: "")
+        layoutItem.target = self
+        menu.addItem(layoutItem)
         menu.addItem(.separator())
 
         let heading = NSMenuItem(title: "Keyboard Shortcut", action: nil, keyEquivalent: "")
@@ -126,7 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         defer { isTiling = false }
 
         let started = CFAbsoluteTimeGetCurrent()
-        let result = tiler.tileAllWindows(relearn: relearn)
+        let result = tiler.tileAllWindows(relearn: relearn, plan: handPickedPlan)
         let durationMilliseconds = Int((CFAbsoluteTimeGetCurrent() - started) * 1_000)
         rememberTopology()
         // Lightweight signal for the live test harness (no disk writes).
@@ -152,11 +163,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleAutoRetile() {
-        let enabled = !isAutoRetileEnabled
+        setAutoRetile(!isAutoRetileEnabled, reason: "automatic re-tiling enabled")
+    }
+
+    /// Turning automatic re-tiling on always means the automatic layout, so
+    /// any hand-picked plan ends here.
+    private func setAutoRetile(_ enabled: Bool, reason: String) {
+        if enabled { handPickedPlan = nil }
         UserDefaults.standard.set(enabled, forKey: autoRetileDefaultsKey)
         autoRetileItem.state = enabled ? .on : .off
         rememberTopology()
-        if enabled { performTile(showFeedback: false, relearn: false, reason: "automatic re-tiling enabled") }
+        if enabled { performTile(showFeedback: false, relearn: false, reason: reason) }
+    }
+
+    // MARK: - Hand-picked layout
+
+    @objc private func openLayoutPanel() {
+        layoutPanel.show(near: statusItem.button, windowCount: windowCountForPanel())
+    }
+
+    /// The count on the display that holds the menu-bar icon (where the
+    /// panel opens). Nil while the window set is unknown.
+    private func windowCountForPanel() -> Int? {
+        guard let counts = tiler.windowCountsPerScreen() else { return nil }
+        let screen = layoutPanel.screenIndex
+            ?? statusItem.button?.window?.screen.flatMap { screen in NSScreen.screens.firstIndex(where: { $0 == screen }) }
+            ?? 0
+        return counts.indices.contains(screen) ? counts[screen] : nil
+    }
+
+    private func applyHandPickedPlan(_ plan: RowPlan) {
+        handPickedPlan = plan
+        UserDefaults.standard.set(false, forKey: autoRetileDefaultsKey)
+        autoRetileItem.state = .off
+        rememberTopology()
+        Log.tiling.notice("Hand-picked rows \(plan.title, privacy: .public); automatic re-tiling paused until the window set changes")
+        performTile(showFeedback: true, relearn: true, reason: "hand-picked rows \(plan.title)")
+    }
+
+    private func chooseAutomaticLayout() {
+        handPickedPlan = nil
+        if isAutoRetileEnabled {
+            performTile(showFeedback: false, relearn: true, reason: "automatic layout chosen")
+        } else {
+            setAutoRetile(true, reason: "automatic layout chosen")
+        }
+    }
+
+    /// The window set changed under a hand-picked layout: that layout was a
+    /// one-time arrangement, so automatic re-tiling comes back on its own.
+    private func endHandPickedLayout() {
+        guard handPickedPlan != nil else { return }
+        handPickedPlan = nil
+        UserDefaults.standard.set(true, forKey: autoRetileDefaultsKey)
+        autoRetileItem.state = .on
+        Log.tiling.notice("Visible window set changed; hand-picked layout ends and automatic re-tiling is back on")
     }
 
     // MARK: - Watching for window changes
@@ -188,7 +249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Called for every window event. Restarts the settle timer so one check
     /// runs after the burst ends.
     private func windowsMayHaveChanged() {
-        guard isAutoRetileEnabled else { return }
+        guard isAutoRetileEnabled || handPickedPlan != nil || layoutPanel.isVisible else { return }
         settleTimer?.invalidate()
         settleTimer = Timer.scheduledTimer(withTimeInterval: settleTime, repeats: false) { [weak self] _ in
             self?.checkForWindowChanges()
@@ -196,7 +257,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func checkForWindowChanges() {
-        guard isAutoRetileEnabled,
+        if layoutPanel.isVisible, !isTiling {
+            layoutPanel.update(windowCount: windowCountForPanel())
+        }
+        guard isAutoRetileEnabled || handPickedPlan != nil,
               !isTiling,
               NSApp.modalWindow == nil,
               tiler.isAccessibilityEnabled(prompt: false) else { return }
@@ -210,12 +274,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if tileRequested {
             tileRequested = false
             lastTopology = topology
+            endHandPickedLayout()
             performTile(showFeedback: false, relearn: false, reason: "space changed")
             return
         }
         guard topology != known else { return }
         Log.tiling.notice("Visible window set changed. Was: \(known, privacy: .public) Now: \(topology, privacy: .public)")
         lastTopology = topology
+        endHandPickedLayout()
         performTile(showFeedback: false, relearn: false, reason: "visible window set changed")
     }
 
