@@ -43,4 +43,29 @@ public enum LayoutEngine {
         }
         return result
     }
+
+    /// Equal-height bands, top to bottom, each split into equal-width
+    /// columns. Every boundary is shared, so neighbors touch exactly and
+    /// the frames come back in reading order.
+    public static func frames(rowCounts: [Int], in bounds: CGRect) -> [CGRect] {
+        let rows = rowCounts.filter { $0 > 0 }
+        guard !rows.isEmpty, bounds.width > 0, bounds.height > 0 else { return [] }
+
+        var result: [CGRect] = []
+        for (row, columns) in rows.enumerated() {
+            let rowStart = round(bounds.height * CGFloat(row) / CGFloat(rows.count))
+            let rowEnd = round(bounds.height * CGFloat(row + 1) / CGFloat(rows.count))
+            for column in 0..<columns {
+                let columnStart = round(bounds.width * CGFloat(column) / CGFloat(columns))
+                let columnEnd = round(bounds.width * CGFloat(column + 1) / CGFloat(columns))
+                result.append(CGRect(
+                    x: bounds.minX + columnStart,
+                    y: bounds.minY + rowStart,
+                    width: columnEnd - columnStart,
+                    height: rowEnd - rowStart
+                ))
+            }
+        }
+        return result
+    }
 }
