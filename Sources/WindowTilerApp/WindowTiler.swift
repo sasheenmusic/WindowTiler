@@ -8,6 +8,12 @@ import WindowTilerCore
 @_silgen_name("_AXUIElementGetWindow")
 private func windowServerID(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
 
+enum DragOutcome {
+    case swapped(String, String)
+    case snappedBack(String)
+    case ignored
+}
+
 struct TilingResult {
     let tiled: Int
     let constrained: Int
@@ -60,6 +66,12 @@ final class WindowTiler {
     }
 
     private var learnedLimits: [String: LearnedLimits] = [:]
+    /// The frame each window was last given (its tile, even when a bounded
+    /// window sits centered inside it). A drag-and-drop swap trades slots.
+    private var slots: [String: CGRect] = [:]
+    /// Set by the drag controller while the user holds a window, so a
+    /// mid-drag position is never recorded as a slot.
+    var isDragging = false
     /// The most windows the automatic layout puts in one row. Set from the
     /// menu; the hand-picked row path ignores it by design.
     var windowsPerRow = TilingLimits.defaultWindowsPerRow
@@ -216,6 +228,7 @@ final class WindowTiler {
         let windows = readingOrder(unordered)
         let frames = LayoutEngine.frames(rowCounts: plan.rows, in: screen)
         guard frames.count == windows.count else { return .empty }
+        for (index, window) in windows.enumerated() { slots[window.identity] = frames[index] }
         var observed = windows.map { CGRect(origin: $0.currentPosition, size: $0.currentSize) }
 
         var requested = false
@@ -361,6 +374,13 @@ final class WindowTiler {
                 flexibleIndices: flexibleIndices, observed: observed
             )
             settle()
+        }
+
+        for (position, index) in boundedIndices.enumerated() where position < layout.constrainedFrames.count {
+            slots[windows[index].identity] = layout.constrainedFrames[position]
+        }
+        for (position, index) in flexibleIndices.enumerated() where position < layout.flexibleFrames.count {
+            slots[windows[index].identity] = layout.flexibleFrames[position]
         }
 
         summaries.append(contentsOf: windows.indices.map { index in
@@ -514,6 +534,7 @@ final class WindowTiler {
         let expiry = Date().addingTimeInterval(-learnedLimitsLifetime)
         learnedLimits = learnedLimits.filter { live.contains($0.key) && $0.value.learnedAt > expiry }
         snapAllowances = snapAllowances.filter { live.contains($0.key) }
+        slots = slots.filter { live.contains($0.key) }
         pendingClamps = pendingClamps.filter { live.contains($0.key) && $0.value.seenAt > expiry }
     }
 
@@ -613,6 +634,7 @@ final class WindowTiler {
     func windowTopologySignature() -> String? {
         let screens = screenBoundsInAccessibilityCoordinates()
         guard let windows = eligibleWindows() else { return nil }
+        rememberSlotsOfNewWindows(windows)
         let signature = ScreenGeometryEngine.topologySignature(
             windowCenters: windows.map { ("\($0.pid)", $0.center) },
             screens: screens
@@ -636,6 +658,79 @@ final class WindowTiler {
             }
         }
         return counts
+    }
+
+    /// A window that was never tiled keeps the spot it already has as its
+    /// slot, so a drag can snap it back there.
+    private func rememberSlotsOfNewWindows(_ windows: [Window]) {
+        guard !isDragging else { return }
+        for window in windows where slots[window.identity] == nil {
+            slots[window.identity] = CGRect(origin: window.currentPosition, size: window.currentSize)
+        }
+    }
+
+    /// The window's current frame, or nil if its app is not answering.
+    func frame(of element: AXUIElement) -> CGRect? {
+        guard let position = pointAttribute(kAXPositionAttribute, from: element),
+              let size = sizeAttribute(kAXSizeAttribute, from: element) else { return nil }
+        return CGRect(origin: position, size: size)
+    }
+
+    // MARK: - Drag to swap
+
+    /// The user released a window they were dragging. If the pointer is
+    /// over another managed window the two trade slots; otherwise the
+    /// dragged window snaps back to its own slot. An edge resize or a
+    /// wobble is left alone.
+    func finishDrag(of element: AXUIElement, startFrame: CGRect, pointer: CGPoint) -> DragOutcome {
+        guard isAccessibilityEnabled(prompt: false), let windows = eligibleWindows() else { return .ignored }
+        pruneLearnedLimits(keeping: windows.map(\.identity))
+        guard let dragged = windows.first(where: { CFEqual($0.element, element) }) else { return .ignored }
+        let current = CGRect(origin: dragged.currentPosition, size: dragged.currentSize)
+        let kind = DragSwapEngine.classify(startFrame: startFrame, endFrame: current)
+        guard kind == .move else {
+            Log.tiling.debug("Drag of \(dragged.name, privacy: .public) was a \(String(describing: kind), privacy: .public); left alone")
+            return .ignored
+        }
+
+        let byIdentity = Dictionary(windows.map { ($0.identity, $0) }, uniquingKeysWith: { first, _ in first })
+        let candidates = (onScreenWindowList() ?? []).compactMap { entry -> DragSwapEngine.Candidate? in
+            let identity = "\(entry.pid):w\(entry.window.number)"
+            guard let window = byIdentity[identity] else { return nil }
+            return DragSwapEngine.Candidate(id: identity, frame: CGRect(origin: window.currentPosition, size: window.currentSize))
+        }
+        let draggedSlot = slots[dragged.identity] ?? startFrame
+
+        restoreEnhancedUserInterface()
+        defer { restoreEnhancedUserInterface() }
+
+        if let targetID = DragSwapEngine.target(at: pointer, excluding: dragged.identity, among: candidates),
+           let target = byIdentity[targetID] {
+            let targetSlot = slots[targetID] ?? CGRect(origin: target.currentPosition, size: target.currentSize)
+            pendingEnhancedUIRestore.formUnion(disableEnhancedUserInterface(for: [dragged.pid, target.pid]))
+            place(dragged, in: targetSlot)
+            place(target, in: draggedSlot)
+            settle()
+            slots[dragged.identity] = targetSlot
+            slots[target.identity] = draggedSlot
+            Log.tiling.notice("Swapped \(dragged.name, privacy: .public) and \(target.name, privacy: .public)")
+            return .swapped(dragged.name, target.name)
+        }
+
+        pendingEnhancedUIRestore.formUnion(disableEnhancedUserInterface(for: [dragged.pid]))
+        place(dragged, in: draggedSlot)
+        settle()
+        Log.tiling.notice("Snapped \(dragged.name, privacy: .public) back")
+        return .snappedBack(dragged.name)
+    }
+
+    private func place(_ window: Window, in frame: CGRect) {
+        guard !isQuarantined(window.pid) else { return }
+        guard window.sizeIsSettable else {
+            _ = centerConstrainedWindow(window.element, in: frame)
+            return
+        }
+        _ = finish(frame: frame, for: window.element, snapAllowance: snapAllowances[window.identity])
     }
 
     /// Nil if the window server's on-screen list cannot be read. Without it
@@ -758,17 +853,27 @@ final class WindowTiler {
     /// Returns nil if the list cannot be read. No Screen Recording permission
     /// is needed for bounds and owner; only window titles require it.
     private func onScreenWindowsByProcess() -> [pid_t: [OnScreenWindow]]? {
+        guard let list = onScreenWindowList() else { return nil }
+        var result: [pid_t: [OnScreenWindow]] = [:]
+        for entry in list {
+            result[entry.pid, default: []].append(entry.window)
+        }
+        return result
+    }
+
+    /// Normal-layer windows the window server draws, front to back.
+    private func onScreenWindowList() -> [(pid: pid_t, window: OnScreenWindow)]? {
         guard let list = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
         ) as? [[String: Any]] else { return nil }
-        var result: [pid_t: [OnScreenWindow]] = [:]
+        var result: [(pid: pid_t, window: OnScreenWindow)] = []
         for info in list {
             guard (info[kCGWindowLayer as String] as? Int) == 0,
                   let pid = info[kCGWindowOwnerPID as String] as? pid_t,
                   let number = info[kCGWindowNumber as String] as? Int,
                   let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: boundsDictionary) else { continue }
-            result[pid, default: []].append(OnScreenWindow(number: number, bounds: bounds))
+            result.append((pid, OnScreenWindow(number: number, bounds: bounds)))
         }
         return result
     }

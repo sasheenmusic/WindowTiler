@@ -9,6 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var shortcutItems: [NSMenuItem] = []
     private var windowsPerRowItems: [NSMenuItem] = []
     private var autoRetileItem: NSMenuItem!
+    private var swapByDraggingItem: NSMenuItem!
+    private var dragSwap: DragSwapController?
     private let layoutPanel = LayoutPanel()
     /// A layout the user picked in the panel. Active only while automatic
     /// re-tiling is off; ends by itself when the visible window set changes.
@@ -30,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let shortcutDefaultsKey = "shortcutIndex"
     private let autoRetileDefaultsKey = "autoRetile"
     private let windowsPerRowDefaultsKey = "windowsPerRow"
+    private let swapByDraggingDefaultsKey = "swapByDragging"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.app.notice("Window Tiler launched")
@@ -62,6 +65,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoRetileItem.target = self
         autoRetileItem.state = isAutoRetileEnabled ? .on : .off
         menu.addItem(autoRetileItem)
+
+        swapByDraggingItem = NSMenuItem(title: "Swap Windows by Dragging", action: #selector(toggleSwapByDragging), keyEquivalent: "")
+        swapByDraggingItem.target = self
+        swapByDraggingItem.state = isSwapByDraggingEnabled ? .on : .off
+        menu.addItem(swapByDraggingItem)
 
         let layoutItem = NSMenuItem(title: "Choose Layout…", action: #selector(openLayoutPanel), keyEquivalent: "")
         layoutItem.target = self
@@ -132,6 +140,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if isAutoRetileEnabled {
             performTile(showFeedback: false, relearn: false, reason: "windows per row set to \(count)")
         }
+    }
+
+    private var isSwapByDraggingEnabled: Bool {
+        if UserDefaults.standard.object(forKey: swapByDraggingDefaultsKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: swapByDraggingDefaultsKey)
+    }
+
+    @objc private func toggleSwapByDragging() {
+        let enabled = !isSwapByDraggingEnabled
+        UserDefaults.standard.set(enabled, forKey: swapByDraggingDefaultsKey)
+        swapByDraggingItem.state = enabled ? .on : .off
+        dragSwap?.isEnabled = enabled
+        Log.app.notice("Swap by dragging \(enabled ? "on" : "off", privacy: .public)")
+    }
+
+    /// The user released a dragged window. Runs under the tiling lock so
+    /// the window-change path stays quiet while windows are placed.
+    private func finishDrag(_ element: AXUIElement, startFrame: CGRect, pointer: CGPoint) {
+        guard !isTiling else { return }
+        isTiling = true
+        defer { isTiling = false }
+        let outcome = tiler.finishDrag(of: element, startFrame: startFrame, pointer: pointer)
+        let reason: String
+        switch outcome {
+        case .swapped: reason = "drag swap"
+        case .snappedBack: reason = "drag snapped back"
+        case .ignored: return
+        }
+        DistributedNotificationCenter.default().postNotificationName(
+            Notification.Name("com.windowtiler.app.didTile"),
+            object: nil,
+            userInfo: ["reason": reason],
+            deliverImmediately: true
+        )
     }
 
     private var isAutoRetileEnabled: Bool {
@@ -273,12 +315,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startWindowMonitor() {
         rememberTopology()
+        let controller = DragSwapController(
+            tiler: tiler,
+            isBusy: { [weak self] in self?.isTiling ?? true },
+            perform: { [weak self] element, startFrame, pointer in
+                self?.finishDrag(element, startFrame: startFrame, pointer: pointer)
+            }
+        )
+        controller.isEnabled = isSwapByDraggingEnabled
+        dragSwap = controller
         eventMonitor = WindowEventMonitor(
             onChange: { [weak self] in self?.windowsMayHaveChanged() },
             onSpaceChange: { [weak self] in
                 self?.tileRequested = true
                 self?.windowsMayHaveChanged()
-            }
+            },
+            onWindowMoved: { [weak self] element in self?.dragSwap?.windowMoved(element) }
         )
         safetyNetTimer = Timer.scheduledTimer(withTimeInterval: safetyNetInterval, repeats: true) { [weak self] _ in
             self?.eventMonitor?.refresh()

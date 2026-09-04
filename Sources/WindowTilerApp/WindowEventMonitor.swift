@@ -11,6 +11,7 @@ final class WindowEventMonitor {
     private var workspaceTokens: [NSObjectProtocol] = []
     private let onChange: () -> Void
     private let onSpaceChange: () -> Void
+    private let onWindowMoved: (AXUIElement) -> Void
 
     /// Registered on the application element; these fire for any window.
     private static let applicationNotifications: [String] = [
@@ -29,9 +30,16 @@ final class WindowEventMonitor {
     ///   - onChange: the visible window set may have changed.
     ///   - onSpaceChange: the user switched Spaces; the windows now on
     ///     screen need tiling even if their count matches the old Space.
-    init(onChange: @escaping () -> Void, onSpaceChange: @escaping () -> Void) {
+    ///   - onWindowMoved: a window reported a new position (by anyone,
+    ///     including Window Tiler itself).
+    init(
+        onChange: @escaping () -> Void,
+        onSpaceChange: @escaping () -> Void,
+        onWindowMoved: @escaping (AXUIElement) -> Void = { _ in }
+    ) {
         self.onChange = onChange
         self.onSpaceChange = onSpaceChange
+        self.onWindowMoved = onWindowMoved
         let workspace = NSWorkspace.shared.notificationCenter
         let workspaceNames: [Notification.Name] = [
             NSWorkspace.didLaunchApplicationNotification,
@@ -96,6 +104,9 @@ final class WindowEventMonitor {
                 if result != .success, let pid = monitor.observers.first(where: { $0.value == observer })?.key {
                     monitor.invalidate(observer, for: pid, timedOut: result == .timedOut)
                 }
+            }
+            if notification as String == kAXWindowMovedNotification {
+                monitor.onWindowMoved(element)
             }
             monitor.onChange()
         }
