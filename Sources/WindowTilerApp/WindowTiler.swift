@@ -107,10 +107,13 @@ final class WindowTiler {
         return AXIsProcessTrustedWithOptions(options)
     }
 
-    /// - Parameter relearn: forget every learned size limit first. Manual
-    ///   tiles use this so a window whose limits changed (a toggled sidebar,
-    ///   a new font size) is measured again.
-    func tileAllWindows(relearn: Bool) -> TilingResult {
+    /// - Parameters:
+    ///   - relearn: forget every learned size limit first. Manual tiles use
+    ///     this so a window whose limits changed (a toggled sidebar, a new
+    ///     font size) is measured again.
+    ///   - plan: a hand-picked split into rows. Applied on every screen whose
+    ///     window count it matches; other screens get the automatic layout.
+    func tileAllWindows(relearn: Bool, plan: RowPlan? = nil) -> TilingResult {
         guard isAccessibilityEnabled(prompt: false) else { return .empty }
         if relearn {
             learnedLimits.removeAll()
@@ -145,7 +148,15 @@ final class WindowTiler {
         var failed = 0
         var summaries: [String] = []
         for index in screens.indices {
-            let result = tile(windows: grouped[index], in: screens[index], summaries: &summaries)
+            let result: TilingResult
+            if let plan, plan.fits(windowCount: grouped[index].count) {
+                result = tileRows(windows: grouped[index], plan: plan, in: screens[index], summaries: &summaries)
+            } else {
+                if let plan, !grouped[index].isEmpty {
+                    Log.tiling.notice("Rows \(plan.title, privacy: .public) do not fit \(grouped[index].count) windows on screen \(index); automatic layout")
+                }
+                result = tile(windows: grouped[index], in: screens[index], summaries: &summaries)
+            }
             tiled += result.tiled
             constrained += result.constrained
             failed += result.failed
@@ -185,16 +196,75 @@ final class WindowTiler {
 
     // MARK: - Tiling one screen
 
-    private func tile(windows unordered: [Window], in screen: CGRect, summaries: inout [String]) -> TilingResult {
-        guard !unordered.isEmpty else { return .empty }
-        let tileStartedAt = Date()
-        // Lay windows out in their current reading order so a re-tile keeps
-        // each window near where it already is instead of reshuffling.
-        let windows = unordered.sorted { first, second in
+    /// Windows in their current reading order, so a re-tile keeps each
+    /// window near where it already is instead of reshuffling.
+    private func readingOrder(_ windows: [Window]) -> [Window] {
+        windows.sorted { first, second in
             let a = (round(first.currentPosition.y / 16), round(first.currentPosition.x / 16), first.identity)
             let b = (round(second.currentPosition.y / 16), round(second.currentPosition.x / 16), second.identity)
             return a < b
         }
+    }
+
+    /// Places windows into the hand-picked bands, slot by slot in reading
+    /// order. No size learning: a window that refuses its slot is centered
+    /// in it, and the next automatic tile measures everything again.
+    private func tileRows(windows unordered: [Window], plan: RowPlan, in screen: CGRect, summaries: inout [String]) -> TilingResult {
+        let windows = readingOrder(unordered)
+        let frames = LayoutEngine.frames(rowCounts: plan.rows, in: screen)
+        guard frames.count == windows.count else { return .empty }
+        var observed = windows.map { CGRect(origin: $0.currentPosition, size: $0.currentSize) }
+
+        var requested = false
+        for (index, window) in windows.enumerated()
+        where window.sizeIsSettable && !isQuarantined(window.pid)
+            && !isSettled(observed[index], in: frames[index], allowance: snapAllowances[window.identity]) {
+            request(frame: frames[index], for: window.element)
+            requested = true
+        }
+        if requested { settle() }
+
+        var tiled = 0
+        var constrained = 0
+        var failed = 0
+        for (index, window) in windows.enumerated() {
+            if isQuarantined(window.pid) {
+                failed += 1
+                continue
+            }
+            guard window.sizeIsSettable else {
+                if centerConstrainedWindow(window.element, in: frames[index]) == .constrained {
+                    constrained += 1
+                } else {
+                    failed += 1
+                }
+                continue
+            }
+            if let origin = pointAttribute(kAXPositionAttribute, from: window.element),
+               let size = sizeAttribute(kAXSizeAttribute, from: window.element) {
+                observed[index] = CGRect(origin: origin, size: size)
+            }
+            let allowance = snapAllowances[window.identity]
+            if isSettled(observed[index], in: frames[index], allowance: allowance) {
+                tiled += 1
+                continue
+            }
+            switch finish(frame: frames[index], for: window.element, snapAllowance: allowance) {
+            case .tiled: tiled += 1
+            case .constrained: constrained += 1
+            case .failed: failed += 1
+            }
+        }
+        summaries.append(contentsOf: windows.indices.map {
+            "\(windows[$0].name): rows \(plan.title) slot \($0 + 1) of \(windows.count)"
+        })
+        return .init(tiled: tiled, constrained: constrained, failed: failed)
+    }
+
+    private func tile(windows unordered: [Window], in screen: CGRect, summaries: inout [String]) -> TilingResult {
+        guard !unordered.isEmpty else { return .empty }
+        let tileStartedAt = Date()
+        let windows = readingOrder(unordered)
 
         var limits = windows.map { window -> SizeLimits in
             guard window.sizeIsSettable else {
@@ -547,6 +617,21 @@ final class WindowTiler {
         // the true window set is unknown; report that rather than a change.
         guard quarantine.pids.isEmpty else { return nil }
         return signature
+    }
+
+    /// Visible window count per screen, in `NSScreen.screens` order, for the
+    /// layout panel. Nil while the true set is unknown (list unavailable or
+    /// an app not answering), never a misleading zero.
+    func windowCountsPerScreen() -> [Int]? {
+        let screens = screenBoundsInAccessibilityCoordinates()
+        guard !screens.isEmpty, let windows = eligibleWindows(), quarantine.pids.isEmpty else { return nil }
+        var counts = Array(repeating: 0, count: screens.count)
+        for window in windows {
+            if let index = ScreenGeometryEngine.screenIndex(for: window.center, screens: screens) {
+                counts[index] += 1
+            }
+        }
+        return counts
     }
 
     /// Nil if the window server's on-screen list cannot be read. Without it
