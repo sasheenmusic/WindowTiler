@@ -1,6 +1,15 @@
 # Window Tiler
 
-A small native macOS menu-bar app that arranges all normal app windows into a balanced, edge-to-edge mosaic.
+A small native macOS menu-bar app that arranges all normal app windows into a balanced, edge-to-edge mosaic. Free and open source under the MIT license.
+
+## Install
+
+1. Download `Window-Tiler-<version>.zip` from the [latest release](../../releases/latest) and unzip it.
+2. Drag **Window Tiler.app** into your Applications folder.
+3. The first time, right-click the app and choose **Open** (it is signed by the author but not notarized by Apple, so macOS shows a warning once). On macOS Sequoia you may instead need **System Settings → Privacy & Security → Open Anyway**.
+4. Allow **Window Tiler** in **System Settings → Privacy & Security → Accessibility** so it can move windows.
+
+Requires macOS 13 or later.
 
 ## Build and run
 
@@ -41,3 +50,7 @@ log stream --predicate 'subsystem == "com.windowtiler.app"'
 swift test
 swift build
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
