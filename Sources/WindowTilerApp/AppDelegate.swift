@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyManager: HotKeyManager!
     private var eventMonitor: WindowEventMonitor?
     private var shortcutItems: [NSMenuItem] = []
+    private var windowsPerRowItems: [NSMenuItem] = []
     private var autoRetileItem: NSMenuItem!
     private let layoutPanel = LayoutPanel()
     /// A layout the user picked in the panel. Active only while automatic
@@ -28,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let safetyNetInterval: TimeInterval = 3
     private let shortcutDefaultsKey = "shortcutIndex"
     private let autoRetileDefaultsKey = "autoRetile"
+    private let windowsPerRowDefaultsKey = "windowsPerRow"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.app.notice("Window Tiler launched")
@@ -40,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         layoutPanel.onAutomatic = { [weak self] in self?.chooseAutomaticLayout() }
         buildMenu()
         selectShortcut(index: savedShortcutIndex(), interactive: false)
+        selectWindowsPerRow(savedWindowsPerRow(), interactive: false)
 
         let accessibilityEnabled = tiler.isAccessibilityEnabled(prompt: true)
         UserDefaults.standard.set(accessibilityEnabled, forKey: "diagnostics.accessibilityEnabled")
@@ -63,6 +66,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let layoutItem = NSMenuItem(title: "Choose Layout…", action: #selector(openLayoutPanel), keyEquivalent: "")
         layoutItem.target = self
         menu.addItem(layoutItem)
+        menu.addItem(.separator())
+
+        let perRowHeading = NSMenuItem(title: "Windows Per Row", action: nil, keyEquivalent: "")
+        perRowHeading.isEnabled = false
+        menu.addItem(perRowHeading)
+        windowsPerRowItems = TilingLimits.windowsPerRowChoices.map { count in
+            let item = NSMenuItem(title: "\(count)", action: #selector(windowsPerRowSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = count
+            menu.addItem(item)
+            return item
+        }
         menu.addItem(.separator())
 
         let heading = NSMenuItem(title: "Keyboard Shortcut", action: nil, keyEquivalent: "")
@@ -91,6 +106,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func savedShortcutIndex() -> Int {
         let stored = UserDefaults.standard.integer(forKey: shortcutDefaultsKey)
         return HotKeyChoice.choices.indices.contains(stored) ? stored : 0
+    }
+
+    private func savedWindowsPerRow() -> Int {
+        let stored = UserDefaults.standard.integer(forKey: windowsPerRowDefaultsKey)
+        return TilingLimits.windowsPerRowChoices.contains(stored) ? stored : TilingLimits.defaultWindowsPerRow
+    }
+
+    @objc private func windowsPerRowSelected(_ sender: NSMenuItem) {
+        selectWindowsPerRow(sender.tag, interactive: true)
+    }
+
+    /// - Parameter interactive: the user just picked this, so the screen
+    ///   should reflect it now. A hand-picked layout ends (the setting shapes
+    ///   the automatic layout, and picking it means wanting that layout).
+    private func selectWindowsPerRow(_ count: Int, interactive: Bool) {
+        guard TilingLimits.windowsPerRowChoices.contains(count) else { return }
+        UserDefaults.standard.set(count, forKey: windowsPerRowDefaultsKey)
+        tiler.windowsPerRow = count
+        windowsPerRowItems.forEach { $0.state = $0.tag == count ? .on : .off }
+        guard interactive else { return }
+        Log.app.notice("Windows per row set to \(count)")
+        if handPickedPlan != nil {
+            chooseAutomaticLayout()
+        } else if isAutoRetileEnabled {
+            performTile(showFeedback: false, relearn: false, reason: "windows per row set to \(count)")
+        }
     }
 
     private var isAutoRetileEnabled: Bool {

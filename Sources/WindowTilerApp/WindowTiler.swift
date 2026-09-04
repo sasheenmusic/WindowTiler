@@ -60,6 +60,9 @@ final class WindowTiler {
     }
 
     private var learnedLimits: [String: LearnedLimits] = [:]
+    /// The most windows the automatic layout puts in one row. Set from the
+    /// menu; the hand-picked row path ignores it by design.
+    var windowsPerRow = TilingLimits.defaultWindowsPerRow
     /// A window's real limits can change (a toggled sidebar, a different
     /// System Settings pane). Learned limits older than this are measured
     /// again on the next tile, so stale values cannot stick around.
@@ -454,7 +457,8 @@ final class WindowTiler {
                     windows[$0].sizeIsSettable ? limits[$0].maximum : windows[$0].currentSize
                 },
                 flexibleMinimumSizes: flexibleIndices.map { limits[$0].minimum },
-                in: screen
+                in: screen,
+                windowsPerRow: windowsPerRow
             )
             let newlyBounded = flexibleIndices.enumerated().compactMap { position, index -> Int? in
                 guard position < layout.flexibleFrames.count else { return index }
