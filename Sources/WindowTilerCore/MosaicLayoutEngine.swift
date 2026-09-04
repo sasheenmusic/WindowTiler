@@ -22,14 +22,16 @@ public enum MosaicLayoutEngine {
     public static func frames(
         constrainedSizes: [CGSize],
         flexibleMinimumSizes: [CGSize],
-        in bounds: CGRect
+        in bounds: CGRect,
+        windowsPerRow: Int = TilingLimits.defaultWindowsPerRow
     ) -> MosaicLayout {
         guard !constrainedSizes.isEmpty else {
             return MosaicLayout(
                 constrainedFrames: [],
                 flexibleFrames: ConstraintGridEngine.frames(
                     minimumSizes: flexibleMinimumSizes,
-                    in: bounds
+                    in: bounds,
+                    windowsPerRow: windowsPerRow
                 )
             )
         }
@@ -46,7 +48,7 @@ public enum MosaicLayoutEngine {
             // If the native windows cannot fit in either direction, retain the
             // ordinary constraint-aware grid as the safest bounded fallback.
             let all = constrainedSizes + flexibleMinimumSizes
-            let frames = ConstraintGridEngine.frames(minimumSizes: all, in: bounds)
+            let frames = ConstraintGridEngine.frames(minimumSizes: all, in: bounds, windowsPerRow: windowsPerRow)
             return MosaicLayout(
                 constrainedFrames: Array(frames.prefix(constrainedSizes.count)),
                 flexibleFrames: Array(frames.dropFirst(constrainedSizes.count))
@@ -57,7 +59,8 @@ public enum MosaicLayoutEngine {
             constrainedFrames: chosen.constrainedFrames,
             flexibleFrames: fill(
                 chosen.freeRegions,
-                minimumSizes: flexibleMinimumSizes
+                minimumSizes: flexibleMinimumSizes,
+                windowsPerRow: windowsPerRow
             )
         )
     }
@@ -117,7 +120,7 @@ public enum MosaicLayoutEngine {
         return Double(fillable) * 1_000_000_000 - Double(unfilledArea)
     }
 
-    private static func fill(_ regions: [CGRect], minimumSizes: [CGSize]) -> [CGRect] {
+    private static func fill(_ regions: [CGRect], minimumSizes: [CGSize], windowsPerRow: Int) -> [CGRect] {
         guard !minimumSizes.isEmpty else { return [] }
 
         let usableRegions = regions
@@ -147,7 +150,8 @@ public enum MosaicLayoutEngine {
             let indices = Array(nextWindow..<end)
             let frames = ConstraintGridEngine.frames(
                 minimumSizes: indices.map { minimumSizes[$0] },
-                in: usableRegions[regionIndex]
+                in: usableRegions[regionIndex],
+                windowsPerRow: windowsPerRow
             )
             for (offset, windowIndex) in indices.enumerated() {
                 result[windowIndex] = frames[offset]

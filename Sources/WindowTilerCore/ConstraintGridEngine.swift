@@ -15,14 +15,19 @@ public enum ConstraintGridEngine {
 
     /// Produces a complete edge-to-edge partition. Minimums determine how much
     /// space a window must receive; every window may grow to absorb the rest.
+    /// - Parameter windowsPerRow: the most windows a row may hold. Windows are
+    ///   spread evenly over the rows that requires. When the screen is too
+    ///   short for that many rows of minimum-height windows, the closest
+    ///   complete layout wins instead, so every window stays visible.
     public static func frames(
         minimumSizes: [CGSize],
         in bounds: CGRect,
-        gap: CGFloat = 0
+        gap: CGFloat = 0,
+        windowsPerRow: Int = TilingLimits.defaultWindowsPerRow
     ) -> [CGRect] {
         guard !minimumSizes.isEmpty else { return [] }
 
-        let preferredRows = Int(ceil(Double(minimumSizes.count) / 5.0))
+        let preferredRows = Int(ceil(Double(minimumSizes.count) / Double(max(1, windowsPerRow))))
         var candidates: [Candidate] = []
         for rowCount in 1...minimumSizes.count {
             for order in orders(for: minimumSizes) {
@@ -47,7 +52,11 @@ public enum ConstraintGridEngine {
             }
         }
 
-        if let best = candidates.min(by: {
+        // At or above the preferred row count no row holds more than the
+        // fold; below it some row must. Only widen the choice when nothing
+        // honoring the fold fits the screen.
+        let withinFold = candidates.filter { $0.rows >= preferredRows }
+        if let best = (withinFold.isEmpty ? candidates : withinFold).min(by: {
             let left = $0.balanceScore + CGFloat(abs($0.rows - preferredRows)) * 0.25
             let right = $1.balanceScore + CGFloat(abs($1.rows - preferredRows)) * 0.25
             return left < right
