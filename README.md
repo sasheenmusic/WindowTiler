@@ -62,6 +62,8 @@ Only one preset is active at a time. It pauses automatic tiling and drag swappin
 
 Click a preset in the menu to activate it. Click it again to turn it off and resume automatic tiling. A preset's optional shortcut does the same. **Tile All Windows** and its shortcut reapply the active preset. Without an active preset, that command also gathers eligible normal windows from other Mac desktops before tiling them; hidden, minimized, and full-screen windows are left alone.
 
+Applying a preset brings its arranged windows to the front. Other windows stay where they are.
+
 **Manage Presets…** shows a list, a read-only layout preview, app and screen checkboxes, and an optional shortcut recorder. Settings save automatically. Changes to an active preset take effect immediately; editing an inactive preset does not activate it. Arrange your actual windows and choose **Update from Current Windows** to replace the saved layout. Updating and deleting require confirmation.
 
 Presets remain saved after restarting Window Tiler, but a normal restart activates none. If an app cannot be launched or moved, the other slots are applied and a message names the app. Moving windows between Mac desktops relies on macOS interfaces that may change; Window Tiler verifies each move and reports failures.
@@ -133,6 +135,8 @@ The installer checks use offline downloads, fake signatures, and launch stubs in
 The updater checks cover restart timing and menu settings. After building the app, `python3 Scripts/test-signed-updates.py` tests real signed upgrades, automatic relaunch, invalid signatures, and an already-current version using disposable apps. This requires the release key in Keychain and never runs the tiler or moves user windows. See [release instructions](Scripts/RELEASING.md) for packaging and signing.
 
 `./Scripts/test-preset-windows.sh` runs the native fixture checks, including restoration across desktops and cancellation. It requires Accessibility access, two existing Mac desktops, and any running Window Tiler instance to be paused or closed. It moves only its disposable test app and removes that app afterward.
+
+`./Scripts/test-preset-foreground.sh` checks preset window order against a covering app, repeated switches, multiple selected apps, and untouched extra windows. Pause or close Window Tiler first. It uses only disposable fixture windows and removes the fixture apps afterward.
 
 ## License
 

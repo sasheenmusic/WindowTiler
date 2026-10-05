@@ -86,6 +86,24 @@ func testWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGW
         let screens = (try? service.captureScreens()) ?? []
         return screens.flatMap(\.slots).filter { $0.app?.bundleID == fixtureID }.count
     }
+    func frontingDiagnostics(_ stage: String) {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(root, 0.5)
+        func selected(_ name: String) -> CGWindowID {
+            guard let value = attribute(name, root), CFGetTypeID(value) == AXUIElementGetTypeID() else { return 0 }
+            return number((value as! AXUIElement)) ?? 0
+        }
+        output("FRONT_DIAG stage=\(stage) fixturePID=\(app.processIdentifier) active=\(app.isActive) callerActive=\(NSRunningApplication.current.isActive) frontmostPID=\(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1) targetID=\(number(mainWindow()) ?? 0) mainID=\(selected(kAXMainWindowAttribute)) focusedID=\(selected(kAXFocusedWindowAttribute))")
+        let apps = Dictionary(uniqueKeysWithValues: NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0) })
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for (index, info) in list.enumerated() {
+            guard (info[kCGWindowLayer as String] as? Int) == 0,
+                  let owner = info[kCGWindowOwnerPID as String] as? NSNumber, let app = apps[owner.int32Value], app.activationPolicy == .regular,
+                  let bounds = info[kCGWindowBounds as String] as? [String: Any],
+                  let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary), frame.width > 80, frame.height > 80 else { continue }
+            output("FRONT_CG order=\(index) id=\((info[kCGWindowNumber as String] as? NSNumber)?.uint32Value ?? 0) pid=\(owner.int32Value) bundle=\(app.bundleIdentifier ?? "nil") bounds=\(frame) layer=0 alpha=\(info[kCGWindowAlpha as String] ?? "nil")")
+        }
+    }
     func launchFixture() async -> NSRunningApplication? {
         await withCheckedContinuation { continuation in
             let config = NSWorkspace.OpenConfiguration(); config.activates = false
@@ -109,12 +127,18 @@ func testWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGW
         guard screen != nil else { command("terminate"); NSApp.terminate(nil); return }
         var report = await apply(preset())
         check(report.tiled == 1 && report.failures.isEmpty && matches(frame(mainWindow()), targetFrame()), "exact same-desktop restore")
+        if !report.failures.isEmpty { frontingDiagnostics("first") }
         if !report.failures.isEmpty { output("DETAIL \(report.failures.joined(separator: " | "))") }
         var changedResolution = preset()
         changedResolution.screens[0].savedWidth /= 2
         changedResolution.screens[0].savedHeight /= 2
         report = await apply(changedResolution)
         check(report.tiled == 1 && report.failures.isEmpty && matches(frame(mainWindow()), targetFrame()), "normalized geometry scales from saved resolution")
+        if !report.failures.isEmpty { frontingDiagnostics("second") }
+        if ProcessInfo.processInfo.environment["WINDOW_TILER_PRESET_FRONT_SMOKE"] == "1" {
+            command("terminate"); await pause(0.4)
+            output("RESULT failures=\(errors)"); NSApp.terminate(nil); return
+        }
         command("extra"); await pause()
         let extra = frame(named("Fixture Extra"))
         fixtureDiagnostics("extra")

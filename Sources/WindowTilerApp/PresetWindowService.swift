@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon
 import WindowTilerCore
 
 @_silgen_name("_AXUIElementGetWindow")
@@ -564,7 +565,9 @@ final class PresetWindowService {
                     service.failed(run, work, "Window did not keep the requested position."); return
                 }
                 run.tiled += 1
-                service.scheduleNext(run)
+                // A preset selects the visible working windows as well as
+                // their frames. Bring only this verified window forward.
+                service.bringToFront(window, expectedID: id, work: work, destination: destination, run: run)
             }
         }
     }
@@ -706,6 +709,95 @@ final class PresetWindowService {
     private func isQuarantined(_ element: AXUIElement) -> Bool {
         var pid: pid_t = 0
         return AXUIElementGetPid(element, &pid) == .success && quarantine.contains(pid)
+    }
+    private func bringToFront(_ window: Window, expectedID: CGWindowID, work: Work, destination: UInt64?, run: Run) {
+        func failedFronting(_ stage: String) { completeFronting(window, run: run, success: false, stage: stage) }
+        let element = window.element
+        guard !isQuarantined(element), number(element) == expectedID else { failedFronting("initial-id"); return }
+        AXUIElementSetMessagingTimeout(element, 0.5)
+        // Raising an inactive app's window alone can leave it behind the
+        // foreground app. Select the exact main/key window before activation;
+        // otherwise activation could raise an unrelated window from this app.
+        // AXFocused is read-only on Chromium and many native windows. Main
+        // selection plus an exact-window raise selects their activation target.
+        guard set(kAXMainAttribute, kCFBooleanTrue, on: element) else { failedFronting("main-selection"); return }
+        guard checked(AXUIElementPerformAction(element, kAXRaiseAction as CFString), element) else { failedFronting("initial-raise"); return }
+        let application = applicationElement(window.app)
+        guard active === run, navigationIsUnchanged(run),
+              isOnDestination(expectedID, screenID: work.screen.id, desktop: destination),
+              selectsWindow(expectedID, application: application) else { failedFronting("main-key-selection"); return }
+        // AppKit may reject an inactive caller's activation request, while
+        // AXFrontmost can raise all of an app's windows. This public process
+        // API explicitly activates only its frontmost nonfloating window.
+        guard activateFrontWindowOnly(of: window.app.processIdentifier) else {
+            failedFronting("activation-request"); return
+        }
+        // App activation is asynchronous. Keep cancellation/Space guards and
+        // verify WindowServer's order instead of trusting an acknowledgement.
+        awaitFront(window, id: expectedID, application: application, work: work, destination: destination,
+                   run: run, deadline: Date().addingTimeInterval(1.5))
+    }
+    private func activateFrontWindowOnly(of pid: pid_t) -> Bool {
+        // These SDK-declared public C APIs are deprecated but remain exported;
+        // Swift hides pre-10.9 deprecated declarations from its importer.
+        typealias GetProcess = @convention(c) (pid_t, UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+        typealias Activate = @convention(c) (UnsafePointer<ProcessSerialNumber>, OptionBits) -> OSStatus
+        guard let handle = dlopen(nil, RTLD_LAZY) else { return false }
+        defer { dlclose(handle) }
+        guard let getSymbol = dlsym(handle, "GetProcessForPID"),
+              let activateSymbol = dlsym(handle, "SetFrontProcessWithOptions") else { return false }
+        var process = ProcessSerialNumber()
+        return unsafeBitCast(getSymbol, to: GetProcess.self)(pid, &process) == noErr
+            && unsafeBitCast(activateSymbol, to: Activate.self)(&process, OptionBits(kSetFrontProcessFrontWindowOnly)) == noErr
+    }
+    private func selectsWindow(_ id: CGWindowID, application: AXUIElement) -> Bool {
+        for name in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
+            guard let selected = attribute(name, application), CFGetTypeID(selected) == AXUIElementGetTypeID(),
+                  number(selected as! AXUIElement) == id else { return false }
+        }
+        return true
+    }
+    private func awaitFront(_ window: Window, id: CGWindowID, application: AXUIElement, work: Work,
+                            destination: UInt64?, run: Run, deadline: Date) {
+        guard active === run, navigationIsUnchanged(run) else { return }
+        guard number(window.element) == id, selectsWindow(id, application: application),
+              isOnDestination(id, screenID: work.screen.id, desktop: destination) else {
+            completeFronting(window, run: run, success: false, stage: "activation-selection"); return
+        }
+        if window.app.isActive {
+            guard checked(AXUIElementPerformAction(window.element, kAXRaiseAction as CFString), window.element) else {
+                completeFronting(window, run: run, success: false, stage: "active-raise"); return
+            }
+            if isFrontWindow(id, on: work.screen) {
+                completeFronting(window, run: run, success: true); return
+            }
+        }
+        guard Date() < deadline, !isQuarantined(window.element) else {
+            completeFronting(window, run: run, success: false, stage: window.app.isActive ? "stack-timeout" : "activation-timeout"); return
+        }
+        later(run, delay: 0.1) { $0.awaitFront(window, id: id, application: application, work: work,
+                                             destination: destination, run: run, deadline: deadline) }
+    }
+    private func isFrontWindow(_ id: CGWindowID, on screen: Screen) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
+        let eligiblePIDs = Set(runningApps().map(\.processIdentifier))
+        let first = list.first { info in
+            guard (info[kCGWindowLayer as String] as? Int) == 0,
+                  let owner = info[kCGWindowOwnerPID as String] as? NSNumber, eligiblePIDs.contains(owner.int32Value),
+                  let bounds = info[kCGWindowBounds as String] as? [String: Any],
+                  let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  frame.width > 80, frame.height > 80 else { return false }
+            return frame.intersects(screen.frame)
+        }
+        return (first?[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id
+    }
+    private func completeFronting(_ window: Window, run: Run, success: Bool, stage: String = "") {
+        guard active === run else { return }
+        if !success {
+            Log.tiling.warning("Preset fronting failed pid=\(window.app.processIdentifier) stage=\(stage, privacy: .public) active=\(window.app.isActive)")
+            run.failures.append("\(window.app.localizedName ?? "App"): window was placed but could not be brought to the front.")
+        }
+        scheduleNext(run)
     }
     private func checked(_ status: AXError, _ element: AXUIElement) -> Bool {
         if status == .cannotComplete {

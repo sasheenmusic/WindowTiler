@@ -14,8 +14,9 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate {
         let window = makeWindow("Fixture Main", NSRect(x: 180, y: 160, width: 640, height: 420))
         window.minSize = NSSize(width: 180, height: 140)
         window.collectionBehavior = [.fullScreenPrimary]
-        for command in ["extra", "closeExtra", "dialog", "hide", "unhide", "minimize", "fullscreen", "exitFullscreen", "invalid", "minimum", "normalMinimum", "closeMain", "terminate"] {
-            tokens.append(DistributedNotificationCenter.default().addObserver(forName: .init("com.windowtiler.fixture.\(command)"), object: nil, queue: .main) { [weak self] _ in
+        for command in ["extra", "closeExtra", "dialog", "hide", "unhide", "minimize", "fullscreen", "exitFullscreen", "invalid", "minimum", "normalMinimum", "closeMain", "terminate", "front", "maximize"] {
+            tokens.append(DistributedNotificationCenter.default().addObserver(forName: .init("com.windowtiler.fixture.\(command)"), object: nil, queue: .main) { [weak self] notification in
+                guard notification.object == nil || notification.object as? String == Bundle.main.bundleIdentifier else { return }
                 self?.perform(command)
             })
         }
@@ -37,6 +38,8 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate {
     func perform(_ command: String) {
         guard let main = windows.first else { return }
         switch command {
+        case "front": main.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        case "maximize": if let screen = main.screen ?? NSScreen.main { main.setFrame(screen.visibleFrame, display: true) }
         case "extra": _ = makeWindow("Fixture Extra", NSRect(x: 870, y: 500, width: 280, height: 200))
         case "closeExtra": for extra in windows.dropFirst() { extra.close() }; windows = [main]
         case "dialog":
