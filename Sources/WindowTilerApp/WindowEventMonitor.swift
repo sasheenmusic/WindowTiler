@@ -5,11 +5,12 @@ import ApplicationServices
 /// It listens to each running app through Accessibility observers and to the
 /// system for launches, quits, hides, Space switches, and display changes.
 final class WindowEventMonitor {
+    enum Change { case windowSet, geometry }
     private var observers: [pid_t: AXObserver] = [:]
     private let quarantine = AppQuarantine.shared
     private let messagingTimeout: Float = 1.0
     private var workspaceTokens: [NSObjectProtocol] = []
-    private let onChange: () -> Void
+    private let onChange: (Change) -> Void
     private let onSpaceChange: () -> Void
     private let onWindowMoved: (AXUIElement) -> Void
 
@@ -28,12 +29,12 @@ final class WindowEventMonitor {
 
     /// - Parameters:
     ///   - onChange: the visible window set may have changed.
-    ///   - onSpaceChange: the user switched Spaces; the windows now on
-    ///     screen need tiling even if their count matches the old Space.
+    ///   - onSpaceChange: the user switched desktops; the owner can refresh
+    ///     its window baseline without rearranging the new desktop.
     ///   - onWindowMoved: a window reported a new position (by anyone,
     ///     including Window Tiler itself).
     init(
-        onChange: @escaping () -> Void,
+        onChange: @escaping (Change) -> Void,
         onSpaceChange: @escaping () -> Void,
         onWindowMoved: @escaping (AXUIElement) -> Void = { _ in }
     ) {
@@ -50,7 +51,7 @@ final class WindowEventMonitor {
         workspaceTokens = workspaceNames.map { name in
             workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.refresh()
-                self?.onChange()
+                self?.onChange(.windowSet)
             }
         }
         workspaceTokens.append(workspace.addObserver(
@@ -63,7 +64,7 @@ final class WindowEventMonitor {
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in self?.onChange() })
+        ) { [weak self] _ in self?.onChange(.windowSet) })
         refresh()
     }
 
@@ -76,6 +77,7 @@ final class WindowEventMonitor {
     /// Attaches to newly launched apps and forgets apps that have quit. Safe
     /// to call often; apps already observed are left alone.
     func refresh() {
+        guard AXIsProcessTrusted() else { return }
         let ownPID = ProcessInfo.processInfo.processIdentifier
         let apps = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && !$0.isTerminated && $0.processIdentifier != ownPID
@@ -88,6 +90,13 @@ final class WindowEventMonitor {
         for pid in livePIDs where observers[pid] == nil && !quarantine.contains(pid) {
             attach(pid: pid)
         }
+    }
+
+    /// Permission changes invalidate registrations made with the old access.
+    func reset() {
+        observers.values.forEach(detach)
+        observers.removeAll()
+        refresh()
     }
 
     private func attach(pid: pid_t) {
@@ -108,7 +117,7 @@ final class WindowEventMonitor {
             if notification as String == kAXWindowMovedNotification {
                 monitor.onWindowMoved(element)
             }
-            monitor.onChange()
+            monitor.onChange(notification as String == kAXWindowMovedNotification ? .geometry : .windowSet)
         }
         guard AXObserverCreate(pid, callback, &observer) == .success, let observer else { return }
 

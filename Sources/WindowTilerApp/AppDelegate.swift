@@ -12,17 +12,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var swapByDraggingItem: NSMenuItem!
     private var dragSwap: DragSwapController?
     private let layoutPanel = LayoutPanel()
+    private let presetPanel = PresetPanel()
+    private let presetWindows = PresetWindowService()
+    private let presetStore = PresetStore(fileURL: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("WindowTiler/presets.json"))
+    private var presets: [LayoutPreset] = []
+    private var activePresetID: UUID?
+    private var presetHotKeys: [UUID: HotKeyManager] = [:]
+    private var presetLoadError: String?
+    private var applicationRevision = 0
+    private var suppressSpaceEventsUntil = Date.distantPast
+    private var needsSpaceBaseline = false
+    private var pendingWindowSetChange = false
+    private var needsPermissionRetile = false
+    private var lastAccessibilityEnabled = false
+    private var spaceTransitionTimer: Timer?
     /// A layout the user picked in the panel. Active only while automatic
     /// re-tiling is off; ends by itself when the visible window set changes.
     private var handPickedPlan: RowPlan?
+    private var deferredTilingTimer: Timer?
     private var settleTimer: Timer?
     private var safetyNetTimer: Timer?
     private var lastTopology: String?
     private var isTiling = false
-    /// Set by a Space switch: tile on the next check even if the window
-    /// count signature did not change (another Space can hold the same
-    /// number of windows of the same apps).
-    private var tileRequested = false
+    private var isOrdinaryTiling = false
+    private var queuedPresetID: UUID?
     /// Window events arrive in bursts (an app opening three windows, a Space
     /// switch). Wait for them to stop before reading the window list once.
     private let settleTime: TimeInterval = 0.25
@@ -43,16 +57,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKeyManager = HotKeyManager { [weak self] in self?.tileWindows() }
         layoutPanel.onApply = { [weak self] plan in self?.applyHandPickedPlan(plan) }
         layoutPanel.onAutomatic = { [weak self] in self?.chooseAutomaticLayout() }
+        configurePresets()
         buildMenu()
         selectShortcut(index: savedShortcutIndex(), interactive: false)
         selectWindowsPerRow(savedWindowsPerRow(), interactive: false)
+        registerPresetShortcuts()
 
         let accessibilityEnabled = tiler.isAccessibilityEnabled(prompt: true)
+        lastAccessibilityEnabled = accessibilityEnabled
         UserDefaults.standard.set(accessibilityEnabled, forKey: "diagnostics.accessibilityEnabled")
         startWindowMonitor()
         if !accessibilityEnabled {
             showPermissionHelp()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        applicationRevision += 1
+        presetWindows.cancel()
+        settleTimer?.invalidate()
+        safetyNetTimer?.invalidate()
+        feedbackTimer?.invalidate()
+        deferredTilingTimer?.invalidate()
+        spaceTransitionTimer?.invalidate()
     }
 
     private func buildMenu() {
@@ -63,7 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         autoRetileItem = NSMenuItem(title: "Automatically Re-tile When Windows Change", action: #selector(toggleAutoRetile), keyEquivalent: "")
         autoRetileItem.target = self
-        autoRetileItem.state = isAutoRetileEnabled ? .on : .off
+        autoRetileItem.state = isAutoRetileEnabled && activePresetID == nil ? .on : .off
         menu.addItem(autoRetileItem)
 
         swapByDraggingItem = NSMenuItem(title: "Swap Windows by Dragging", action: #selector(toggleSwapByDragging), keyEquivalent: "")
@@ -74,6 +101,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let layoutItem = NSMenuItem(title: "Choose Layout…", action: #selector(openLayoutPanel), keyEquivalent: "")
         layoutItem.target = self
         menu.addItem(layoutItem)
+        menu.addItem(.separator())
+        let presetsHeading = NSMenuItem(title: "Presets", action: nil, keyEquivalent: "")
+        presetsHeading.isEnabled = false
+        menu.addItem(presetsHeading)
+        if presets.isEmpty {
+            let empty = NSMenuItem(title: "No saved presets", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+        for preset in presets {
+            let item = NSMenuItem(title: preset.name, action: #selector(presetSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = preset.id.uuidString
+            item.state = activePresetID == preset.id ? .on : .off
+            menu.addItem(item)
+        }
+        let savePreset = NSMenuItem(title: "Save Preset…", action: #selector(savePresetPressed), keyEquivalent: "")
+        savePreset.target = self
+        menu.addItem(savePreset)
+        let managePresets = NSMenuItem(title: "Manage Presets…", action: #selector(managePresetsPressed), keyEquivalent: "")
+        managePresets.target = self
+        menu.addItem(managePresets)
         menu.addItem(.separator())
 
         let perRowHeading = NSMenuItem(title: "Windows Per Row", action: nil, keyEquivalent: "")
@@ -135,6 +184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowsPerRowItems.forEach { $0.state = $0.tag == count ? .on : .off }
         guard interactive else { return }
         Log.app.notice("Windows per row set to \(count)")
+        if activePresetID != nil { return }
         if handPickedPlan != nil {
             chooseAutomaticLayout()
         } else if isAutoRetileEnabled {
@@ -151,14 +201,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let enabled = !isSwapByDraggingEnabled
         UserDefaults.standard.set(enabled, forKey: swapByDraggingDefaultsKey)
         swapByDraggingItem.state = enabled ? .on : .off
-        dragSwap?.isEnabled = enabled
+        dragSwap?.isEnabled = enabled && activePresetID == nil
         Log.app.notice("Swap by dragging \(enabled ? "on" : "off", privacy: .public)")
     }
 
     /// The user released a dragged window. Runs under the tiling lock so
     /// the window-change path stays quiet while windows are placed.
     private func finishDrag(_ element: AXUIElement, startFrame: CGRect, pointer: CGPoint) {
-        guard !isTiling else { return }
+        guard !isTiling, !presetWindows.isApplying, activePresetID == nil else { return }
         isTiling = true
         defer { isTiling = false }
         let outcome = tiler.finishDrag(of: element, startFrame: startFrame, pointer: pointer)
@@ -190,16 +240,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   modal alert there would block startup.
     private func selectShortcut(index: Int, interactive: Bool) {
         guard HotKeyChoice.choices.indices.contains(index) else { return }
-        let registered = hotKeyManager.register(HotKeyChoice.choices[index])
-        UserDefaults.standard.set(registered, forKey: "diagnostics.hotKeyRegistered")
-        shortcutItems.enumerated().forEach { $0.element.state = $0.offset == index && registered ? .on : .off }
+        let choice = HotKeyChoice.choices[index]
+        if interactive, let conflict = presets.first(where: { $0.shortcut?.keyCode == choice.keyCode && $0.shortcut?.modifiers == choice.modifiers }) {
+            if interactive { showAlert(title: "Shortcut already used", message: "This shortcut belongs to the preset “\(conflict.name)”.") }
+            return
+        }
+        let registered = hotKeyManager.register(choice)
+        UserDefaults.standard.set(hotKeyManager.currentChoice != nil, forKey: "diagnostics.hotKeyRegistered")
+        let selectedIndex = registered ? index : savedShortcutIndex()
+        shortcutItems.enumerated().forEach { $0.element.state = $0.offset == selectedIndex && hotKeyManager.currentChoice != nil ? .on : .off }
         if registered {
             Log.app.notice("Registered shortcut \(HotKeyChoice.choices[index].title, privacy: .public)")
             UserDefaults.standard.set(index, forKey: shortcutDefaultsKey)
             statusItem.button?.toolTip = "Window Tiler — \(HotKeyChoice.choices[index].title)"
         } else {
             Log.app.error("Could not register shortcut \(HotKeyChoice.choices[index].title, privacy: .public)")
-            statusItem.button?.toolTip = "Window Tiler — no shortcut registered"
+            if hotKeyManager.currentChoice == nil { statusItem.button?.toolTip = "Window Tiler — no shortcut registered" }
             if interactive {
                 showAlert(title: "Shortcut unavailable", message: "Another app is already using that shortcut. Choose a different one from the Window Tiler menu.")
             }
@@ -207,7 +263,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func tileWindows() {
-        performTile(showFeedback: true, relearn: true, reason: "hotkey or menu")
+        if let activePresetID {
+            applyPreset(activePresetID)
+            return
+        }
+        guard !isTiling, tiler.isAccessibilityEnabled(prompt: true) else {
+            if !tiler.isAccessibilityEnabled(prompt: false) { showPermissionHelp() }
+            return
+        }
+        isTiling = true
+        applicationRevision += 1
+        let revision = applicationRevision
+        presetWindows.gatherForTiling { [weak self] failures in
+            guard let self, self.applicationRevision == revision else { return }
+            self.isTiling = false
+            if self.presetWindows.lastOperationWasCancelled {
+                self.rememberTopology()
+                if !failures.isEmpty { self.showPresetFeedback(failures) }
+                return
+            }
+            self.performTile(showFeedback: true, relearn: true, reason: "hotkey or menu")
+            if !failures.isEmpty { self.showPresetFeedback(failures) }
+        }
     }
 
     private func performTile(showFeedback: Bool, relearn: Bool, reason: String) {
@@ -215,9 +292,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if showFeedback { showPermissionHelp() }
             return
         }
+        guard activePresetID == nil else { return }
+        deferredTilingTimer?.invalidate()
+        if isOrdinaryTiling || presetWindows.isApplying {
+            let revision = applicationRevision
+            deferredTilingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak self] _ in
+                guard let self, self.applicationRevision == revision else { return }
+                self.performTile(showFeedback: showFeedback, relearn: relearn, reason: reason)
+            }
+            return
+        }
         guard !isTiling else { return }
+        _ = refreshAccessibilityState()
+        pendingWindowSetChange = false
+        needsPermissionRetile = false
         isTiling = true
-        defer { isTiling = false }
+        isOrdinaryTiling = true
+        defer {
+            isOrdinaryTiling = false
+            isTiling = false
+            if let queued = queuedPresetID {
+                queuedPresetID = nil
+                applyPreset(queued)
+            }
+        }
 
         let started = CFAbsoluteTimeGetCurrent()
         let result = tiler.tileAllWindows(relearn: relearn, plan: handPickedPlan)
@@ -243,18 +341,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             showAlert(title: "Tiling finished", message: details)
         }
+        if pendingWindowSetChange { windowsMayHaveChanged() }
     }
 
     @objc private func toggleAutoRetile() {
-        setAutoRetile(!isAutoRetileEnabled, reason: "automatic re-tiling enabled")
+        if activePresetID != nil {
+            deactivatePreset()
+        } else {
+            setAutoRetile(!isAutoRetileEnabled, reason: "automatic re-tiling enabled")
+        }
     }
 
     /// Turning automatic re-tiling on always means the automatic layout, so
     /// any hand-picked plan ends here.
     private func setAutoRetile(_ enabled: Bool, reason: String) {
+        if !enabled {
+            deferredTilingTimer?.invalidate()
+            pendingWindowSetChange = false
+            needsPermissionRetile = false
+        }
         if enabled { handPickedPlan = nil }
         UserDefaults.standard.set(enabled, forKey: autoRetileDefaultsKey)
-        autoRetileItem.state = enabled ? .on : .off
+        autoRetileItem.state = enabled && activePresetID == nil ? .on : .off
         rememberTopology()
         if enabled { performTile(showFeedback: false, relearn: false, reason: reason) }
     }
@@ -268,7 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The count on the display that holds the menu-bar icon (where the
     /// panel opens). Nil while the window set is unknown.
     private func windowCountForPanel() -> Int? {
-        guard let counts = tiler.windowCountsPerScreen() else { return nil }
+        guard !presetWindows.isApplying, let counts = tiler.windowCountsPerScreen() else { return nil }
         let screen = layoutPanel.screenIndex
             ?? statusItem.button?.window?.screen.flatMap { screen in NSScreen.screens.firstIndex(where: { $0 == screen }) }
             ?? 0
@@ -276,6 +384,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyHandPickedPlan(_ plan: RowPlan) {
+        clearPresetSession()
         handPickedPlan = plan
         UserDefaults.standard.set(false, forKey: autoRetileDefaultsKey)
         autoRetileItem.state = .off
@@ -285,6 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func chooseAutomaticLayout() {
+        clearPresetSession()
         handPickedPlan = nil
         if isAutoRetileEnabled {
             performTile(showFeedback: false, relearn: true, reason: "automatic layout chosen")
@@ -308,40 +418,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Records the current window set as the baseline. An unknown set (an
     /// app is not answering) never replaces a known one.
     private func rememberTopology() {
+        guard refreshAccessibilityState(), !presetWindows.isApplying else { return }
         if let topology = tiler.windowTopologySignature() {
             lastTopology = topology
+            needsSpaceBaseline = Date() < suppressSpaceEventsUntil
         }
+    }
+
+    @discardableResult
+    private func refreshAccessibilityState() -> Bool {
+        let enabled = tiler.isAccessibilityEnabled(prompt: false)
+        guard enabled != lastAccessibilityEnabled else { return enabled }
+        lastAccessibilityEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "diagnostics.accessibilityEnabled")
+        tiler.resetAccessibilityState()
+        eventMonitor?.reset()
+        lastTopology = nil
+        if enabled, activePresetID == nil, isAutoRetileEnabled || handPickedPlan != nil {
+            needsPermissionRetile = true
+        }
+        return enabled
     }
 
     private func startWindowMonitor() {
         rememberTopology()
         let controller = DragSwapController(
             tiler: tiler,
-            isBusy: { [weak self] in self?.isTiling ?? true },
+            isBusy: { [weak self] in
+                guard let self else { return true }
+                return self.isTiling || self.presetWindows.isApplying
+            },
             perform: { [weak self] element, startFrame, pointer in
                 self?.finishDrag(element, startFrame: startFrame, pointer: pointer)
             }
         )
-        controller.isEnabled = isSwapByDraggingEnabled
+        controller.isEnabled = isSwapByDraggingEnabled && activePresetID == nil
         dragSwap = controller
         eventMonitor = WindowEventMonitor(
-            onChange: { [weak self] in self?.windowsMayHaveChanged() },
+            onChange: { [weak self] change in self?.windowsMayHaveChanged(change) },
             onSpaceChange: { [weak self] in
-                self?.tileRequested = true
-                self?.windowsMayHaveChanged()
+                guard let self else { return }
+                // Space navigation is not a request to rearrange windows. Wait
+                // for the transition, then accept its window set as a baseline.
+                self.suppressSpaceEventsUntil = Date().addingTimeInterval(1)
+                self.needsSpaceBaseline = true
+                self.spaceTransitionTimer?.invalidate()
+                self.spaceTransitionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { [weak self] _ in
+                    guard let self, !self.isTiling, self.needsSpaceBaseline else { return }
+                    if self.activePresetID == nil, self.isAutoRetileEnabled || self.handPickedPlan != nil {
+                        self.checkForWindowChanges()
+                    } else {
+                        self.rememberTopology()
+                    }
+                }
+                self.windowsMayHaveChanged()
             },
             onWindowMoved: { [weak self] element in self?.dragSwap?.windowMoved(element) }
         )
         safetyNetTimer = Timer.scheduledTimer(withTimeInterval: safetyNetInterval, repeats: true) { [weak self] _ in
-            self?.eventMonitor?.refresh()
-            self?.checkForWindowChanges()
+            guard let self else { return }
+            if self.refreshAccessibilityState() { self.eventMonitor?.refresh() }
+            self.checkForWindowChanges()
         }
         safetyNetTimer?.tolerance = safetyNetInterval / 2
     }
 
     /// Called for every window event. Restarts the settle timer so one check
     /// runs after the burst ends.
-    private func windowsMayHaveChanged() {
+    private func windowsMayHaveChanged(_ change: WindowEventMonitor.Change = .geometry) {
+        if change == .windowSet, activePresetID == nil, isAutoRetileEnabled || handPickedPlan != nil,
+           needsSpaceBaseline || isTiling || presetWindows.isApplying || NSApp.modalWindow != nil {
+            pendingWindowSetChange = true
+        }
+        guard activePresetID == nil || layoutPanel.isVisible else { return }
         guard isAutoRetileEnabled || handPickedPlan != nil || layoutPanel.isVisible else { return }
         settleTimer?.invalidate()
         settleTimer = Timer.scheduledTimer(withTimeInterval: settleTime, repeats: false) { [weak self] _ in
@@ -350,32 +499,306 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func checkForWindowChanges() {
+        guard refreshAccessibilityState() else { return }
         if layoutPanel.isVisible, !isTiling {
             layoutPanel.update(windowCount: windowCountForPanel())
         }
-        guard isAutoRetileEnabled || handPickedPlan != nil,
-              !isTiling,
-              NSApp.modalWindow == nil,
-              tiler.isAccessibilityEnabled(prompt: false) else { return }
+        guard activePresetID == nil,
+              isAutoRetileEnabled || handPickedPlan != nil,
+              !isTiling, !presetWindows.isApplying,
+              NSApp.modalWindow == nil else { return }
         // A nil signature means the state is unknown, not changed. Without a
         // baseline yet, this signature becomes the baseline; nothing is tiled.
         guard let topology = tiler.windowTopologySignature() else { return }
-        guard let known = lastTopology else {
+        if needsSpaceBaseline {
+            lastTopology = topology
+            guard Date() >= suppressSpaceEventsUntil else { return }
+            needsSpaceBaseline = false
+            guard pendingWindowSetChange || needsPermissionRetile else { return }
+        }
+        let known = lastTopology
+        guard known != nil || pendingWindowSetChange || needsPermissionRetile else {
             lastTopology = topology
             return
         }
-        if tileRequested {
-            tileRequested = false
-            lastTopology = topology
-            endHandPickedLayout()
-            performTile(showFeedback: false, relearn: false, reason: "space changed")
-            return
-        }
-        guard topology != known else { return }
-        Log.tiling.notice("Visible window set changed. Was: \(known, privacy: .public) Now: \(topology, privacy: .public)")
+        let changedTopology = known.map { $0 != topology } ?? false
+        guard changedTopology || pendingWindowSetChange || needsPermissionRetile else { return }
+        let reason = needsPermissionRetile ? "accessibility permission enabled" : "visible window set changed"
+        Log.tiling.notice("[\(reason, privacy: .public)] Was: \(known ?? "unknown", privacy: .public) Now: \(topology, privacy: .public)")
         lastTopology = topology
-        endHandPickedLayout()
-        performTile(showFeedback: false, relearn: false, reason: "visible window set changed")
+        if changedTopology || pendingWindowSetChange { endHandPickedLayout() }
+        performTile(showFeedback: false, relearn: false, reason: reason)
+    }
+
+    // MARK: - Saved presets
+
+    private func configurePresets() {
+        do { presets = try presetStore.load() }
+        catch { presetLoadError = "Saved presets could not be read. The file has been left unchanged. \(error.localizedDescription)" }
+        presetPanel.onSaveNew = { [weak self] in self?.savePreset($0, isNew: true) ?? false }
+        presetPanel.onChange = { [weak self] in _ = self?.savePreset($0, isNew: false) }
+        presetPanel.onDelete = { [weak self] in self?.deletePreset($0) }
+        presetPanel.onApply = { [weak self] in self?.applyPreset($0) }
+        presetPanel.onNew = { [weak self] in self?.savePresetPressed() }
+        presetPanel.onUpdate = { [weak self] in self?.updatePresetFromWindows($0) }
+        presetPanel.onValidateShortcut = { [weak self] shortcut, id in self?.shortcutConflict(shortcut, excluding: id) }
+        presetPanel.onRecordingShortcutChange = { [weak self] recording in
+            guard let self else { return }
+            let managers = [self.hotKeyManager! ] + Array(self.presetHotKeys.values)
+            if recording { managers.forEach { $0.suspend() } }
+            else {
+                let restored = managers.map { $0.resume() }
+                if restored.contains(false) { self.showPresetFeedback(["A shortcut became unavailable. Choose another in Manage Presets."]) }
+            }
+        }
+    }
+
+    private func shortcutConflict(_ shortcut: PresetShortcut, excluding id: UUID?) -> String? {
+        let global = HotKeyChoice.choices[savedShortcutIndex()]
+        if shortcut.keyCode == global.keyCode && shortcut.modifiers == global.modifiers {
+            return "This shortcut is already used for Tile All Windows."
+        }
+        if let other = presets.first(where: { $0.id != id && $0.shortcut == shortcut }) {
+            return "This shortcut is already used by “\(other.name)”."
+        }
+        return nil
+    }
+
+    private func registerPresetShortcuts() {
+        for preset in presets {
+            guard let shortcut = preset.shortcut else { continue }
+            guard shortcutConflict(shortcut, excluding: preset.id) == nil else {
+                Log.app.error("Saved preset shortcut conflicts with another shortcut")
+                DispatchQueue.main.async { [weak self] in
+                    self?.showPresetFeedback(["The shortcut for “\(preset.name)” conflicts with another shortcut. Choose another in Manage Presets."])
+                }
+                continue
+            }
+            let manager = makePresetHotKey(preset.id)
+            if manager.register(HotKeyChoice(title: preset.name, keyCode: shortcut.keyCode, modifiers: shortcut.modifiers)) {
+                presetHotKeys[preset.id] = manager
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.showPresetFeedback(["The shortcut for “\(preset.name)” is unavailable. Choose another in Manage Presets."])
+                }
+            }
+        }
+    }
+
+    private func makePresetHotKey(_ id: UUID) -> HotKeyManager {
+        HotKeyManager { [weak self] in self?.togglePreset(id) }
+    }
+
+    private func refreshPresetControls() {
+        buildMenu()
+        shortcutItems.enumerated().forEach { $0.element.state = $0.offset == savedShortcutIndex() && hotKeyManager.currentChoice != nil ? .on : .off }
+        windowsPerRowItems.forEach { $0.state = $0.tag == savedWindowsPerRow() ? .on : .off }
+        dragSwap?.isEnabled = isSwapByDraggingEnabled && activePresetID == nil
+        presetPanel.refresh(presets: presets, activeID: activePresetID)
+    }
+
+    @objc private func savePresetPressed() {
+        if let presetLoadError { presetPanel.showError(presetLoadError); return }
+        guard !isTiling, !presetWindows.isApplying else { showPresetFeedback(["Wait for the current layout to finish, then save again."]); return }
+        do {
+            let screens = try presetWindows.captureScreens()
+            presetPanel.showSave(screens: screens, currentScreenID: PresetWindowService.currentScreenID())
+        } catch { presetPanel.showError(error.localizedDescription) }
+    }
+
+    @objc private func managePresetsPressed() {
+        presetPanel.showManage(presets: presets, activeID: activePresetID)
+        if let presetLoadError { presetPanel.showError(presetLoadError) }
+    }
+
+    @objc private func presetSelected(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String, let id = UUID(uuidString: value) else { return }
+        togglePreset(id)
+    }
+
+    private func togglePreset(_ id: UUID) {
+        if queuedPresetID == id { queuedPresetID = nil; return }
+        if activePresetID == id { deactivatePreset() }
+        else { applyPreset(id) }
+    }
+
+    @discardableResult
+    private func savePreset(_ value: LayoutPreset, isNew: Bool) -> Bool {
+        if isNew, isOrdinaryTiling {
+            presetPanel.showError("Wait for the current layout to finish, then save again.")
+            return false
+        }
+        guard presetLoadError == nil else { presetPanel.showError(presetLoadError!); return false }
+        var preset = value
+        preset.name = preset.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !preset.name.isEmpty else { presetPanel.showError("Give the preset a name."); return false }
+        guard !presets.contains(where: { $0.id != preset.id && $0.name.localizedCaseInsensitiveCompare(preset.name) == .orderedSame }) else {
+            presetPanel.showError("A preset already has that name.")
+            refreshPresetControls()
+            return false
+        }
+        guard preset.screens.contains(where: { $0.isIncluded && !$0.slots.isEmpty }) else {
+            presetPanel.showError("Select a screen with at least one saved window.")
+            refreshPresetControls()
+            return false
+        }
+        if !preset.rememberApps { preset.launchMissingApps = false }
+        let previous = presets.first { $0.id == preset.id }
+        var candidateManager: HotKeyManager?
+        if let shortcut = preset.shortcut, previous?.shortcut != shortcut || presetHotKeys[preset.id] == nil {
+            if let conflict = shortcutConflict(shortcut, excluding: preset.id) {
+                presetPanel.showError(conflict)
+                refreshPresetControls()
+                return false
+            }
+            let manager = makePresetHotKey(preset.id)
+            guard manager.register(HotKeyChoice(title: preset.name, keyCode: shortcut.keyCode, modifiers: shortcut.modifiers)) else {
+                presetPanel.showError("That shortcut is unavailable. Try another combination.")
+                refreshPresetControls()
+                return false
+            }
+            candidateManager = manager
+        }
+        var updated = presets
+        if let index = updated.firstIndex(where: { $0.id == preset.id }) { updated[index] = preset }
+        else { updated.append(preset) }
+        do { try presetStore.save(updated) }
+        catch {
+            presetPanel.showError("The preset could not be saved. \(error.localizedDescription)")
+            refreshPresetControls()
+            return false
+        }
+        presets = updated
+        if preset.shortcut == nil { presetHotKeys.removeValue(forKey: preset.id) }
+        else if let candidateManager { presetHotKeys[preset.id] = candidateManager }
+        if isNew {
+            // Captured windows already have the requested geometry. Activating
+            // without moving them also preserves the user's keyboard focus.
+            cancelPresetApplication()
+            activePresetID = preset.id
+            handPickedPlan = nil
+            rememberTopology()
+        }
+        refreshPresetControls()
+        if !isNew, activePresetID == preset.id,
+           previous?.screens != preset.screens || previous?.rememberApps != preset.rememberApps || previous?.launchMissingApps != preset.launchMissingApps {
+            applyPreset(preset.id)
+        }
+        return true
+    }
+
+    private func updatePresetFromWindows(_ id: UUID) {
+        guard var preset = presets.first(where: { $0.id == id }) else { return }
+        guard !isTiling, !presetWindows.isApplying else { showPresetFeedback(["Wait for the current layout to finish, then update again."]); return }
+        do {
+            let captured = try presetWindows.captureScreens()
+            var merged = preset.screens
+            for var screen in captured {
+                if let index = merged.firstIndex(where: { $0.id == screen.id }) {
+                    let old = merged[index]
+                    screen.isIncluded = old.isIncluded
+                    let bound = Set(old.slots.filter { $0.restoreApp }.compactMap { $0.app?.bundleID })
+                    let excluded = Set(old.slots.compactMap { $0.app?.bundleID }).subtracting(bound)
+                    for index in screen.slots.indices {
+                        if let app = screen.slots[index].app, excluded.contains(app.bundleID) { screen.slots[index].restoreApp = false }
+                    }
+                    merged[index] = screen
+                } else {
+                    screen.isIncluded = false
+                    merged.append(screen)
+                }
+            }
+            preset.screens = merged
+            savePreset(preset, isNew: false)
+        } catch { presetPanel.showError(error.localizedDescription) }
+    }
+
+    private func deletePreset(_ id: UUID) {
+        guard presetLoadError == nil else { return }
+        let updated = presets.filter { $0.id != id }
+        do { try presetStore.save(updated) }
+        catch { presetPanel.showError("The preset could not be deleted. \(error.localizedDescription)"); return }
+        presets = updated
+        presetHotKeys.removeValue(forKey: id)
+        if activePresetID == id { deactivatePreset() }
+        else { refreshPresetControls() }
+    }
+
+    private func cancelPresetApplication() {
+        deferredTilingTimer?.invalidate()
+        queuedPresetID = nil
+        pendingWindowSetChange = false
+        needsPermissionRetile = false
+        applicationRevision += 1
+        presetWindows.cancel()
+        isTiling = isOrdinaryTiling
+    }
+
+    private func clearPresetSession() {
+        cancelPresetApplication()
+        activePresetID = nil
+        refreshPresetControls()
+    }
+
+    private func deactivatePreset() {
+        clearPresetSession()
+        handPickedPlan = nil
+        setAutoRetile(true, reason: "preset turned off")
+    }
+
+    private func applyPreset(_ id: UUID) {
+        guard let preset = presets.first(where: { $0.id == id }) else { return }
+        if isOrdinaryTiling { queuedPresetID = id; return }
+        guard tiler.isAccessibilityEnabled(prompt: true) else { showPermissionHelp(); return }
+        cancelPresetApplication()
+        let revision = applicationRevision
+        activePresetID = id
+        handPickedPlan = nil
+        isTiling = true
+        refreshPresetControls()
+        presetWindows.apply(preset) { [weak self] report in
+            guard let self, self.applicationRevision == revision else { return }
+            self.isTiling = false
+            self.rememberTopology()
+            self.refreshPresetControls()
+            DistributedNotificationCenter.default().postNotificationName(
+                Notification.Name("com.windowtiler.app.didTile"), object: nil,
+                userInfo: ["reason": "preset", "tiled": report.tiled, "failed": report.failures.count], deliverImmediately: true)
+            if !report.failures.isEmpty { self.showPresetFeedback(report.failures) }
+        }
+    }
+
+    private var feedbackPanel: NSPanel?
+    private var feedbackTimer: Timer?
+
+    private func showPresetFeedback(_ messages: [String]) {
+        feedbackTimer?.invalidate()
+        feedbackPanel?.close()
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 430, height: 130),
+                            styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        panel.title = "Window Tiler"
+        panel.isReleasedWhenClosed = false
+        panel.level = .floating
+        let label = NSTextField(wrappingLabelWithString: messages.joined(separator: "\n"))
+        label.translatesAutoresizingMaskIntoConstraints = false
+        let content = NSView()
+        content.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            label.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            label.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            label.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
+            content.widthAnchor.constraint(equalToConstant: 430)
+        ])
+        panel.contentView = content
+        panel.setContentSize(NSSize(width: 430, height: max(90, min(400, content.fittingSize.height))))
+        panel.center()
+        panel.orderFrontRegardless()
+        feedbackPanel = panel
+        feedbackTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: false) { [weak self] _ in
+            self?.feedbackPanel?.close()
+            self?.feedbackPanel = nil
+        }
     }
 
     // MARK: - Alerts

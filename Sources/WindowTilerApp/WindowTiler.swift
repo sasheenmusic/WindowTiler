@@ -85,12 +85,9 @@ final class WindowTiler {
     /// is treated as a tiled window with a little wiggle room, not as a
     /// bounded one.
     private var snapAllowances: [String: CGSize] = [:]
-    private var applicationElements: [pid_t: AXUIElement] = [:]
     private let quarantine = AppQuarantine.shared
-    /// Apps whose AXEnhancedUserInterface flag we switched off and could not
-    /// switch back yet (they were quarantined mid-tile). Retried each tile.
-    private var pendingEnhancedUIRestore = Set<pid_t>()
-    private var restoreRetryScheduled = false
+    private let enhancedUI = EnhancedUIState.shared
+    private var visibleAppPIDs = Set<pid_t>()
     /// Unchanged sizes seen once after an accepted request, by window
     /// identity. A clamp is only believed when a later, separate tile shows
     /// the same unchanged size: two reads 40 ms apart inside one tile are
@@ -99,7 +96,6 @@ final class WindowTiler {
     /// Consumed by the confirmation, pruned with the other caches.
     private var pendingClamps: [String: (size: CGSize, seenAt: Date)] = [:]
     private let systemWideElement = AXUIElementCreateSystemWide()
-    private let enhancedUserInterfaceAttribute = "AXEnhancedUserInterface"
 
     /// Seconds to wait for another app before giving up on an Accessibility
     /// request. The default is six seconds per request, which lets one hung
@@ -120,6 +116,18 @@ final class WindowTiler {
     func isAccessibilityEnabled(prompt: Bool) -> Bool {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
         return AXIsProcessTrustedWithOptions(options)
+    }
+
+    /// Permission recovery invalidates learned/discovery state. New AX roots
+    /// are made on each scan; no stale Accessibility handles survive recovery.
+    func resetAccessibilityState() {
+        visibleAppPIDs.removeAll()
+        learnedLimits.removeAll()
+        snapAllowances.removeAll()
+        pendingClamps.removeAll()
+        slots.removeAll()
+        quarantine.reset()
+        enhancedUI.restorePending()
     }
 
     /// - Parameters:
@@ -154,9 +162,8 @@ final class WindowTiler {
             grouped[screenIndex].append(window)
         }
 
-        restoreEnhancedUserInterface()
-        pendingEnhancedUIRestore.formUnion(disableEnhancedUserInterface(for: Set(windows.map(\.pid))))
-        defer { restoreEnhancedUserInterface() }
+        let lease = enhancedUI.begin(for: Set(windows.map(\.pid)))
+        defer { enhancedUI.end(lease) }
 
         var tiled = 0
         var constrained = 0
@@ -178,35 +185,6 @@ final class WindowTiler {
         }
         Log.tiling.debug("Layout: \(summaries.joined(separator: " | "), privacy: .public)")
         return .init(tiled: tiled, constrained: constrained, failed: failed)
-    }
-
-    /// With this flag set (assistive apps turn it on), Chromium and Electron
-    /// apps animate or refuse moves and resizes. Switch it off for the apps
-    /// being tiled and put it back afterwards; returns the apps that had it.
-    private func disableEnhancedUserInterface(for pids: Set<pid_t>) -> [pid_t] {
-        pids.filter { pid in
-            let app = applicationElement(for: pid)
-            guard (attribute(enhancedUserInterfaceAttribute, from: app) as? Bool) == true else { return false }
-            return setAttribute(enhancedUserInterfaceAttribute, to: kCFBooleanFalse, on: app)
-        }
-    }
-
-    /// An app quarantined while tiling keeps its pending restoration and is
-    /// retried at the start and end of every later tile.
-    private func restoreEnhancedUserInterface() {
-        for pid in pendingEnhancedUIRestore where !isQuarantined(pid) {
-            if setAttribute(enhancedUserInterfaceAttribute, to: kCFBooleanTrue, on: applicationElement(for: pid)) {
-                pendingEnhancedUIRestore.remove(pid)
-            }
-        }
-        // Whatever is still pending gets another try once the quarantine
-        // has ended, even if no further tile happens.
-        guard !pendingEnhancedUIRestore.isEmpty, !restoreRetryScheduled else { return }
-        restoreRetryScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + quarantine.cooldown + 0.5) { [weak self] in
-            self?.restoreRetryScheduled = false
-            self?.restoreEnhancedUserInterface()
-        }
     }
 
     // MARK: - Tiling one screen
@@ -641,7 +619,7 @@ final class WindowTiler {
         )
         // While an app is not answering, its windows cannot be listed, so
         // the true window set is unknown; report that rather than a change.
-        guard quarantine.pids.isEmpty else { return nil }
+        guard !quarantine.intersects(visibleAppPIDs) else { return nil }
         return signature
     }
 
@@ -650,7 +628,7 @@ final class WindowTiler {
     /// an app not answering), never a misleading zero.
     func windowCountsPerScreen() -> [Int]? {
         let screens = screenBoundsInAccessibilityCoordinates()
-        guard !screens.isEmpty, let windows = eligibleWindows(), quarantine.pids.isEmpty else { return nil }
+        guard !screens.isEmpty, let windows = eligibleWindows(), !quarantine.intersects(visibleAppPIDs) else { return nil }
         var counts = Array(repeating: 0, count: screens.count)
         for window in windows {
             if let index = ScreenGeometryEngine.screenIndex(for: window.center, screens: screens) {
@@ -701,13 +679,11 @@ final class WindowTiler {
         }
         let draggedSlot = slots[dragged.identity] ?? startFrame
 
-        restoreEnhancedUserInterface()
-        defer { restoreEnhancedUserInterface() }
-
         if let targetID = DragSwapEngine.target(at: pointer, excluding: dragged.identity, among: candidates),
            let target = byIdentity[targetID] {
             let targetSlot = slots[targetID] ?? CGRect(origin: target.currentPosition, size: target.currentSize)
-            pendingEnhancedUIRestore.formUnion(disableEnhancedUserInterface(for: [dragged.pid, target.pid]))
+            let lease = enhancedUI.begin(for: [dragged.pid, target.pid])
+            defer { enhancedUI.end(lease) }
             place(dragged, in: targetSlot)
             place(target, in: draggedSlot)
             settle()
@@ -717,7 +693,8 @@ final class WindowTiler {
             return .swapped(dragged.name, target.name)
         }
 
-        pendingEnhancedUIRestore.formUnion(disableEnhancedUserInterface(for: [dragged.pid]))
+        let lease = enhancedUI.begin(for: [dragged.pid])
+        defer { enhancedUI.end(lease) }
         place(dragged, in: draggedSlot)
         settle()
         Log.tiling.notice("Snapped \(dragged.name, privacy: .public) back")
@@ -744,10 +721,9 @@ final class WindowTiler {
         }
         // Per-app state outlives hiding; only a quit app is forgotten.
         let alivePIDs = Set(alive.map(\.processIdentifier))
-        applicationElements = applicationElements.filter { alivePIDs.contains($0.key) }
         quarantine.forget(except: alivePIDs)
-        pendingEnhancedUIRestore = pendingEnhancedUIRestore.filter { alivePIDs.contains($0) }
-        let running = alive.filter { !$0.isHidden }
+        let running = alive.filter { !$0.isHidden && (onScreen[$0.processIdentifier] ?? []).contains { $0.bounds.width > 80 && $0.bounds.height > 80 } }
+        visibleAppPIDs = Set(running.map(\.processIdentifier))
 
         return running
             .flatMap { app -> [Window] in
@@ -765,10 +741,11 @@ final class WindowTiler {
     }
 
     private func applicationElement(for pid: pid_t) -> AXUIElement {
-        if let element = applicationElements[pid] { return element }
+        // Electron can replace its Accessibility tree without changing PID.
+        // Reusing an old app root then omits real on-screen windows. Creating
+        // this local handle is cheap compared with the following IPC reads.
         let element = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(element, messagingTimeout)
-        applicationElements[pid] = element
         return element
     }
 
@@ -890,14 +867,6 @@ final class WindowTiler {
         let status = AXUIElementIsAttributeSettable(element, name as CFString, &settable)
         if status == .cannotComplete { quarantine(element) }
         return status == .success && settable.boolValue
-    }
-
-    @discardableResult
-    private func setAttribute(_ name: String, to value: CFTypeRef, on element: AXUIElement) -> Bool {
-        guard !isQuarantined(element) else { return false }
-        let status = AXUIElementSetAttributeValue(element, name as CFString, value)
-        if status == .cannotComplete { quarantine(element) }
-        return status == .success
     }
 
     /// The window server id, or nil if the app did not answer.
