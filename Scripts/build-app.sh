@@ -8,7 +8,9 @@ app_dir="dist/Window Tiler.app"
 contents_dir="$app_dir/Contents"
 mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources"
 cp ".build/release/WindowTiler" "$contents_dir/MacOS/WindowTiler"
+strip -S "$contents_dir/MacOS/WindowTiler"
 cp "Resources/Info.plist" "$contents_dir/Info.plist"
+cp "Resources/AppIcon.icns" "$contents_dir/Resources/AppIcon.icns"
 # Prefer the Mac owner's real Apple Development identity. Unlike an ad-hoc
 # signature, this keeps Accessibility trust attached across rebuilt versions.
 signing_identity="${WINDOW_TILER_SIGNING_IDENTITY:-}"

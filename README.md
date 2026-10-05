@@ -1,50 +1,84 @@
 # Window Tiler
 
-A small native macOS menu-bar app that arranges all normal app windows into a balanced, edge-to-edge mosaic. Free and open source under the MIT license.
+<img src="Resources/AppIcon.png" alt="Window Tiler icon" width="128">
+
+Turn your open windows into a tidy, edge-to-edge layout. Window Tiler is a small, free macOS menu-bar app that works across multiple displays.
+
+**Requires macOS 13 or later.** Released under the MIT license.
 
 ## Install
 
-1. Download `Window-Tiler-<version>.zip` from the [latest release](../../releases/latest) and unzip it.
-2. Drag **Window Tiler.app** into your Applications folder.
-3. The first time, right-click the app and choose **Open** (it is signed by the author but not notarized by Apple, so macOS shows a warning once). On macOS Sequoia you may instead need **System Settings → Privacy & Security → Open Anyway**.
-4. Allow **Window Tiler** in **System Settings → Privacy & Security → Accessibility** so it can move windows.
+1. Download the ZIP from the [latest release](../../releases/latest).
+2. Unzip it and move **Window Tiler.app** to **Applications**.
+3. Right-click the app and choose **Open**. If macOS blocks it, go to **System Settings → Privacy & Security → Open Anyway**. The app is not notarized by Apple.
+4. Enable Window Tiler under **System Settings → Privacy & Security → Accessibility** so it can move and resize windows.
 
-Requires macOS 13 or later.
+## Start tiling
 
-## Build and run
+Press **Control–Option–Command–T**, or click the grid icon in the menu bar and choose **Tile All Windows**.
+
+Automatic tiling is on by default. Windows reflow when they open, close, minimize, return, or move between displays. You can turn it off or change the keyboard shortcut in the menu.
+
+## Pick your layout
+
+| Control | What it does |
+| --- | --- |
+| **Windows Per Row** | Set the automatic layout to use up to 2, 3, 4, or 5 windows per row. |
+| **Choose Layout…** | Pick the number of windows in each row using a five-by-five grid. |
+| **Swap Windows by Dragging** | Drag one window onto another to trade their places. |
+
+In **Choose Layout…**, each grid row is a band of the screen, from top to bottom. To put four windows above one window, click the fourth square in row 1 and the first square in row 2. **Apply** becomes available when your choices add up to the number of open windows on that display. Click a selected square again to clear its row.
+
+A custom layout pauses automatic tiling. Opening or closing a window, or changing Spaces, returns to the automatic layout. Until then, the shortcut re-applies your custom layout.
+
+When swapping, drop a window over another managed window. A drop elsewhere snaps it back. Normal edge resizing is left alone.
+
+## How windows are handled
+
+- Each display gets its own layout above the Dock and below the menu bar.
+- Hidden and minimized windows, and windows on other Spaces, are skipped.
+- Open and Save panels, modal dialogs, tiny helper panels, and floating palettes are left alone.
+- Window Tiler learns each window's size limits and adjusts the layout to fit them.
+- Terminal windows can leave a small gap because they resize in whole character cells.
+- Switching native window tabs does not trigger a re-tile.
+- Wispr Flow's transparent status overlay is ignored.
+
+There is no hard window limit. If the display gets crowded, the app uses the closest layout that keeps every window visible.
+
+## Build from source
+
+With the Xcode command-line tools installed:
 
 ```bash
+git clone https://github.com/sasheenmusic/WindowTiler.git
+cd WindowTiler
 ./Scripts/build-app.sh
 open "dist/Window Tiler.app"
 ```
 
-On first launch, allow **Window Tiler** in **System Settings → Privacy & Security → Accessibility**.
+The build script uses an available Apple Development signing identity to help keep Accessibility trust across local rebuilds. For a public build without a developer certificate, use an ad-hoc signature:
 
-Press **Control–Option–Command–T** to tile your windows. Click the grid icon in the menu bar to tile manually, choose another shortcut, or turn automatic re-tiling on and off.
+```bash
+WINDOW_TILER_SIGNING_IDENTITY=- ./Scripts/build-app.sh
+```
 
-**Choose Layout…** opens a small floating panel with a five-by-five matrix for the times the automatic split is not the one you want. Each row of the matrix is a band of the screen, top to bottom. Click the fourth square in row 1 and the first square in row 2 to put four windows across the top and one below; click a lit square again to clear its row. The panel shows how many windows are open on that display, and Apply lights up when the squares add up to that number. Bands are equal height and the windows in a band share its width. Applying pauses automatic re-tiling; the moment a window opens, closes, or the Space changes, automatic re-tiling turns itself back on and reflows. Until then the shortcut and Tile All Windows re-apply the hand-picked layout. The matrix holds up to five per row and five rows.
+Ad-hoc builds may need Accessibility access granted again after a rebuild.
 
-**Swap by dragging.** Drag any window onto the area of another window and let go: the two trade places, each taking the other's tile. Drop a window on empty space, on its own area, or on something Window Tiler does not manage, and it snaps back to where it was. Dragging an edge to resize, or a click that wobbles a few points, is left alone. The gesture works whether automatic re-tiling is on or off and can be switched off with **Swap Windows by Dragging** in the menu.
+## Troubleshooting
 
-Automatic re-tiling is on by default. Switching between native window tabs (Terminal, Finder, TextEdit) does not count as a change, and a re-tile keeps windows in their current reading order. Window Tiler listens for window events instead of polling, so when a normal window opens, closes, minimizes, or returns, the visible windows reflow about a quarter of a second after the change settles. Minimized windows, hidden apps, and windows on other Spaces stay out of the way until you bring them back.
+**Windows do not move:** check **System Settings → Privacy & Security → Accessibility**.
 
-Windows stay on their current display and are tiled within that display's usable area, avoiding the menu bar and Dock. Every visible window receives an approximately equal share of the display. Open and Save panels and modal dialogs are never tiled, and a non-modal window reported as a dialog counts only when the app has no standard window at all. Temporary system popups, tiny helper panels, and floating palettes are left alone.
+**A window will not fit:** some apps enforce a minimum or maximum window size. Window Tiler works around these limits where possible.
 
-Window Tiler learns the minimum and maximum size each window actually permits by watching what the window does when asked to fill its tile, and re-lays out the screen with that knowledge. Learned limits are forgotten when a window closes and re-measured on every manual tile. Terminal resizes in whole character cells, so a window that lands up to one cell short of its tile keeps that wiggle room at its bottom and right edges instead of being treated as fixed-size. It allows up to five windows per row while the screen can still honor every window's minimum size, then compares valid arrangements and favors equal row heights and equal window areas. **Windows Per Row** in the menu changes that fold to 2, 3, 4, or 5 (the default); windows are still spread evenly across the rows the fold requires, so five windows at 2 become 2 + 2 + 1. The choice is remembered, takes effect immediately, ends any hand-picked layout, and shapes the automatic layout only; the Choose Layout matrix stays five wide. Minimum-size windows may grow to complete a row; truly bounded windows become blocks that the other windows tile around. Shared pixel boundaries make every tile touch its neighbors and the usable screen edges with zero gaps. There is no hard window limit: if the screen becomes too crowded to preserve both five-across and every minimum size, Window Tiler keeps every window visible and uses the closest complete layout that fits.
+**An app is slow to respond:** Accessibility requests are capped at one second. An app that times out is skipped for five seconds.
 
-On multi-monitor Macs, each display is tiled independently using its own usable area. Moving a window to another display, changing a resolution, moving the menu bar or Dock, and connecting or disconnecting a display all trigger automatic re-tiling.
-
-Wispr Flow's transparent status HUD is ignored because macOS reports it as a large window even though it has no visible content.
-
-Every Accessibility request is capped at one second, and an app that fails to answer in time is skipped for five seconds instead of freezing the tiler. Learned size limits expire after ten minutes so a window whose limits change is measured again.
-
-Diagnostics go to the unified log:
+To view diagnostics:
 
 ```bash
 log stream --predicate 'subsystem == "com.windowtiler.app"'
 ```
 
-## Develop
+## Development
 
 ```bash
 swift test
@@ -53,4 +87,4 @@ swift build
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[MIT](LICENSE).
