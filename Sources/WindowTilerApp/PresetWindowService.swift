@@ -534,6 +534,22 @@ final class PresetWindowService {
     }
 
     private func place(_ window: Window, id: CGWindowID, frame: CGRect, work: Work, destination: UInt64?, run: Run) {
+        // Switching back to an app preset often only needs its windows raised.
+        // Read the restored window now: its captured frame may predate a user
+        // resize, unminimizing, or movement from another desktop.
+        if let actual = self.frame(window.element),
+           abs(actual.minX - frame.minX) <= 1, abs(actual.minY - frame.minY) <= 1,
+           abs(actual.width - frame.width) <= 1, abs(actual.height - frame.height) <= 1,
+           !window.app.isHidden, bool(kAXMinimizedAttribute, window.element) != true,
+           bool("AXFullScreen", window.element) != true, number(window.element) == id,
+           screens().contains(where: { $0.id == work.screen.id && $0.frame == work.screen.frame }),
+           screenFor(actual, among: screens())?.id == work.screen.id,
+           isOnDestination(id, screenID: work.screen.id, desktop: destination) {
+            guard active === run, navigationIsUnchanged(run) else { return }
+            run.tiled += 1
+            bringToFront(window, expectedID: id, work: work, destination: destination, run: run)
+            return
+        }
         let lease = enhancedUI.begin(for: [window.app.processIdentifier])
         enhancedLeases.insert(lease)
         let moved = setPoint(frame.origin, on: window.element)

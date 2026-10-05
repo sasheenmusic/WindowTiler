@@ -60,6 +60,12 @@ func testWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGW
         var id: CGWindowID = 0
         return testWindowID(window, &id) == .success && id != 0 ? id : nil
     }
+    func serverFrame(_ id: CGWindowID) -> CGRect? {
+        let list = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]] ?? []
+        guard let info = list.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id }),
+              let bounds = info[kCGWindowBounds as String] as? [String: Any] else { return nil }
+        return CGRect(dictionaryRepresentation: bounds as CFDictionary)
+    }
     func matches(_ a: CGRect?, _ b: CGRect?) -> Bool {
         guard let a, let b else { return false }
         return abs(a.minX-b.minX) < 3 && abs(a.minY-b.minY) < 3 && abs(a.width-b.width) < 3 && abs(a.height-b.height) < 3
@@ -186,6 +192,15 @@ func testWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGW
             if !report.failures.isEmpty { output("DETAIL \(report.failures.joined(separator: " | "))") }
         }
         command("exitFullscreen"); await pause(1)
+        if ProcessInfo.processInfo.environment["WINDOW_TILER_EXPECT_FAST_PATH"] != "0" {
+            let beforeMinimum = frame(mainWindow())
+            command("minimum"); await pause(0.3)
+            report = await apply(preset())
+            check(report.tiled == 1 && report.failures.isEmpty && matches(frame(mainWindow()), beforeMinimum),
+                  "already-fitting frame stays unchanged when app minimum changes without a resize")
+        }
+        // A real resize must still honor the app's newly raised minimum.
+        command("maximize"); await pause(0.3)
         command("minimum"); await pause(0.3)
         report = await apply(preset())
         check(report.tiled == 1 && report.failures.contains(where: { $0.contains("minimum or fixed") }), "native size constraints reported")
@@ -244,23 +259,33 @@ func testWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGW
         check(gatherFailures.isEmpty && bridge.spaces(of:id)?.contains(original) == true, "gather fixture from another Space")
         if !gatherFailures.isEmpty { output("DETAIL \(gatherFailures.joined(separator:" | "))") }
         _ = beforeGather
-        _ = bridge.requestMove(id,to:other); await pause(0.4)
-        var cancellationCalls = 0
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void,Never>) in
-            service.apply(preset()) { _ in
-                cancellationCalls += 1
-                continuation.resume()
-            }
-            service.cancel()
-        }
-        await pause(0.6)
-        check(cancellationCalls == 1 && bridge.spaces(of:id) == [other], "cancel pending pull returns fixture to original Space once")
-        _ = bridge.requestMove(id,to:original); await pause(0.4)
         command("invalid"); await pause(0.4)
         guard let invalidID = number(named("Fixture Invalid")) else { check(false,"invalid fixture created"); return }
+        check(named("Fixture Invalid").flatMap { attribute(kAXSubroleAttribute, $0) as? String } == kAXDialogSubrole,
+              "rollback fixture cannot pass normal-window AX validation")
         let invalidBefore = frame(named("Fixture Invalid"))
+        let invalidServerFrame = serverFrame(invalidID)
         _ = bridge.requestMove(invalidID,to:other); await pause(0.4)
         check(bridge.spaces(of:invalidID) == [other], "nonstandard fixture moved for validation test")
+        // A normal window may already be identified before immediate cancel.
+        // This dialog cannot pass AX validation: observe its real transfer
+        // while the operation is still pending, then exercise actual rollback.
+        var cancellationCalls = 0
+        service.gatherForTiling { _ in cancellationCalls += 1 }
+        let transferDeadline = Date().addingTimeInterval(2)
+        while bridge.spaces(of:invalidID) != [original], cancellationCalls == 0,
+              Date() < transferDeadline { await pause(0.05) }
+        check(bridge.spaces(of:invalidID) == [original] && cancellationCalls == 0 && service.isApplying,
+              "unvalidated fixture transfer is observed pending before cancel")
+        service.cancel()
+        let rollbackDeadline = Date().addingTimeInterval(4)
+        while cancellationCalls == 0, Date() < rollbackDeadline { await pause(0.05) }
+        check(cancellationCalls == 1 && service.lastOperationWasCancelled && bridge.spaces(of:invalidID) == [other],
+              "cancel pending pull returns fixture to original Space once")
+        await pause(0.2)
+        check(cancellationCalls == 1 && !service.isApplying, "cancelled pull completes once with no pending cleanup")
+        // AXWindows omits it again after rollback to the off-Space desktop.
+        check(matches(serverFrame(invalidID), invalidServerFrame), "cancel pending pull preserves fixture geometry")
         let failedGather: [String] = await withCheckedContinuation { continuation in service.gatherForTiling { continuation.resume(returning:$0) } }
         check(!failedGather.isEmpty && bridge.spaces(of:invalidID) == [other], "failed AX validation returns nonstandard fixture")
         if failedGather.isEmpty || bridge.spaces(of:invalidID) != [other] { output("DETAIL \(failedGather.joined(separator:" | "))") }

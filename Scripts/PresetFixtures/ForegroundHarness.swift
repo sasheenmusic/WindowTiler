@@ -5,6 +5,10 @@ import WindowTilerCore
 @_silgen_name("_AXUIElementGetWindow")
 func foregroundWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
 
+enum PresetFixtureMetrics {
+    static var geometryWrites = 0
+}
+
 @MainActor final class ForegroundHarness: NSObject, NSApplicationDelegate {
     let service = PresetWindowService()
     let targetID = "com.windowtiler.foreground-target-fixture"
@@ -12,6 +16,8 @@ func foregroundWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePoint
     var apps: [String: NSRunningApplication] = [:]
     var screen: PresetScreen!
     var failures = 0
+    var lastGeometryWrites = 0
+    let expectsFastPath = ProcessInfo.processInfo.environment["WINDOW_TILER_EXPECT_FAST_PATH"] != "0"
     let small = PresetRect(x: 0.08, y: 0.12, width: 0.32, height: 0.38)
     let full = PresetRect(x: 0, y: 0, width: 1, height: 1)
     func output(_ message: String) { FileHandle.standardOutput.write(Data((message + "\n").utf8)) }
@@ -93,7 +99,13 @@ func foregroundWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePoint
             slots: [PresetSlot(rect: rect, app: PresetApp(bundleID: id, name: "Foreground fixture"))])], rememberApps: remember)
     }
     func apply(_ preset: LayoutPreset) async -> PresetApplyReport {
-        await withCheckedContinuation { continuation in service.apply(preset) { continuation.resume(returning: $0) } }
+        PresetFixtureMetrics.geometryWrites = 0
+        let started = ProcessInfo.processInfo.systemUptime
+        let report: PresetApplyReport = await withCheckedContinuation { continuation in service.apply(preset) { continuation.resume(returning: $0) } }
+        lastGeometryWrites = PresetFixtureMetrics.geometryWrites
+        output(String(format: "BENCHMARK windows=%d remember=%@ seconds=%.4f geometryWrites=%d", report.tiled,
+                      String(preset.rememberApps), ProcessInfo.processInfo.systemUptime - started, lastGeometryWrites))
+        return report
     }
     func launch(_ id: String, name: String) async -> NSRunningApplication? {
         let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/\(name).app")
@@ -123,6 +135,7 @@ func foregroundWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePoint
         let coverFrame = frame(window(coverID))
         var report = await apply(preset(targetID, rect: small))
         await checkRaised(report, target, cover, "remembered target raised above foreground covering app")
+        if expectsFastPath { check(lastGeometryWrites == 0, "unchanged remembered window requires no geometry writes") }
         check(matches(frame(window(coverID)), coverFrame) && !apps[coverID]!.isHidden && attribute(kAXMinimizedAttribute, window(coverID)!) as? Bool == false, "unselected covering app geometry and state unchanged")
         let extraUnmoved = matches(frame(window(targetID, title: "Fixture Extra")), extraFrame)
         let extraBelowCover = above(cover, extra)
@@ -136,6 +149,15 @@ func foregroundWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePoint
             report = await apply(preset(coverID, rect: full))
             await checkRaised(report, cover, target, "cycle \(cycle) covering preset brought front")
         }
+        let correctFrame = frame(window(targetID))
+        command("maximize", targetID); await pause()
+        check(!matches(frame(window(targetID)), correctFrame), "fixture manual resize changed its saved geometry")
+        report = await apply(preset(targetID, rect: small))
+        check(report.tiled == 1 && report.failures.isEmpty && lastGeometryWrites > 0
+              && matches(frame(window(targetID)), correctFrame), "reapply corrects manual resize through normal placement")
+        report = await apply(preset(targetID, rect: small))
+        check(report.tiled == 1 && report.failures.isEmpty && matches(frame(window(targetID)), correctFrame), "same-frame reapply preserves exact saved geometry")
+        if expectsFastPath { check(lastGeometryWrites == 0, "same-frame reapply skips all geometry writes") }
         // A third, unselected normal window covers two apps before applying a
         // two-app preset. It belongs to the harness, so discovery excludes it.
         let third = NSWindow(contentRect: NSScreen.screens[0].visibleFrame,
@@ -172,6 +194,9 @@ func foregroundWindowID(_ element: AXUIElement, _ identifier: UnsafeMutablePoint
         report = await apply(preset(targetID, rect: small, remember: false))
         await checkRaised(report, target, newExtra, "layout-only preset raises its selected window")
         check(matches(frame(window(targetID, title: "Fixture Extra")), newExtraFrame) && apps[coverID]!.isHidden, "layout-only extras and unrelated hidden state unchanged")
+        report = await apply(preset(targetID, rect: small, remember: false))
+        await checkRaised(report, target, newExtra, "same-frame layout-only reapply keeps its selected window front")
+        if expectsFastPath { check(lastGeometryWrites == 0, "unchanged layout-only window requires no geometry writes") }
         let beforeGather = orderedIDs().filter { $0 == target || $0 == newExtra }
         let gather: [String] = await withCheckedContinuation { continuation in service.gatherForTiling { continuation.resume(returning: $0) } }
         await pause()

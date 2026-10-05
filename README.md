@@ -66,6 +66,8 @@ Click a preset in the menu to activate it. Click it again to turn it off and res
 
 Applying a preset brings its arranged windows to the front. Other windows stay where they are.
 
+Reapplying a preset is faster when its windows are already in their saved positions.
+
 **Manage Presets…** shows a list, a read-only layout preview, app and screen checkboxes, and an optional shortcut recorder. Settings save automatically. Changes to an active preset take effect immediately; editing an inactive preset does not activate it. Arrange your actual windows and choose **Update from Current Windows** to replace the saved layout. Updating and deleting require confirmation.
 
 Presets remain saved after restarting Window Tiler, but a normal restart activates none. If an app cannot be launched or moved, the other slots are applied and a message names the app. Moving windows between Mac desktops relies on macOS interfaces that may change; Window Tiler verifies each move and reports failures.

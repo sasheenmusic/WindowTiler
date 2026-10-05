@@ -402,6 +402,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// panel opens). Nil while the window set is unknown.
     private func windowCountForPanel() -> Int? {
         guard !presetWindows.isApplying, let counts = tiler.windowCountsPerScreen() else { return nil }
+        return windowCountForPanel(from: counts)
+    }
+
+    private func windowCountForPanel(from counts: [Int]?) -> Int? {
+        guard let counts else { return nil }
         let screen = layoutPanel.screenIndex
             ?? statusItem.button?.window?.screen.flatMap { screen in NSScreen.screens.firstIndex(where: { $0 == screen }) }
             ?? 0
@@ -525,16 +530,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func checkForWindowChanges() {
         guard refreshAccessibilityState() else { return }
-        if layoutPanel.isVisible, !isTiling {
-            layoutPanel.update(windowCount: windowCountForPanel())
+        let canCheckTopology = activePresetID == nil
+            && (isAutoRetileEnabled || handPickedPlan != nil)
+            && !isTiling && !presetWindows.isApplying && NSApp.modalWindow == nil
+        let topology: String?
+        if layoutPanel.isVisible, !isTiling, canCheckTopology {
+            let snapshot = tiler.windowTopologyAndCounts()
+            layoutPanel.update(windowCount: windowCountForPanel(from: snapshot?.counts))
+            topology = snapshot?.signature
+        } else {
+            topology = canCheckTopology ? tiler.windowTopologySignature() : nil
+            if layoutPanel.isVisible, !isTiling {
+                layoutPanel.update(windowCount: windowCountForPanel())
+            }
         }
-        guard activePresetID == nil,
-              isAutoRetileEnabled || handPickedPlan != nil,
-              !isTiling, !presetWindows.isApplying,
-              NSApp.modalWindow == nil else { return }
         // A nil signature means the state is unknown, not changed. Without a
         // baseline yet, this signature becomes the baseline; nothing is tiled.
-        guard let topology = tiler.windowTopologySignature() else { return }
+        guard canCheckTopology, let topology else { return }
         if needsSpaceBaseline {
             lastTopology = topology
             guard Date() >= suppressSpaceEventsUntil else { return }

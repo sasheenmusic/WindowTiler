@@ -76,11 +76,18 @@ final class WindowTiler {
     var topology: String? = "initial"
     var tileCount = 0
     var onTile: (() -> Void)?
+    var topologyReads = 0
+    var countReads = 0
+    var combinedReads = 0
     init() { accessibilityEnabled = Self.initialAccessibilityEnabled; Self.latest = self }
     func isAccessibilityEnabled(prompt: Bool) -> Bool { if prompt { systemPromptCount += 1 }; return accessibilityEnabled }
     func resetAccessibilityState() { resetCount += 1 }
-    func windowTopologySignature() -> String? { topology }
-    func windowCountsPerScreen() -> [Int]? { [2] }
+    func windowTopologySignature() -> String? { topologyReads += 1; return topology }
+    func windowCountsPerScreen() -> [Int]? { countReads += 1; return [2] }
+    func windowTopologyAndCounts() -> (signature: String, counts: [Int])? {
+        combinedReads += 1
+        return topology.map { ($0, [2]) }
+    }
     struct TileResult { var tiled = 2; var constrained = 0; var failed = 0 }
     enum DragOutcome { case swapped, snappedBack, ignored }
     func tileAllWindows(relearn: Bool, plan: RowPlan?) -> TileResult { tileCount += 1; onTile?(); return TileResult() }
@@ -106,12 +113,15 @@ final class DragSwapController {
     func windowMoved(_ element: AXUIElement) {}
 }
 final class LayoutPanel {
+    static var latest: LayoutPanel!
     var onApply: ((RowPlan) -> Void)?
     var onAutomatic: (() -> Void)?
-    let isVisible = false
+    var isVisible = false
+    var updatedCounts: [Int?] = []
+    init() { Self.latest = self }
     let screenIndex: Int? = 0
     func show(near button: NSStatusBarButton?, windowCount: Int?) {}
-    func update(windowCount: Int?) {}
+    func update(windowCount: Int?) { updatedCounts.append(windowCount) }
 }
 
 struct PresetApplyReport { var tiled = 2; var failures: [String] = [] }
@@ -206,9 +216,37 @@ final class AppUpdater {
         delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
         defer { delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification)) }
         let panel = PresetPanel.latest!, windows = PresetWindowService.latest!, tiler = WindowTiler.latest!, events = WindowEventMonitor.latest!
+        let layout = LayoutPanel.latest!
+        layout.isVisible = true
+        var beforeReads = (tiler.topologyReads, tiler.countReads, tiler.combinedReads)
+        events.change(.geometry); pump()
+        try require(tiler.topologyReads == beforeReads.0 && tiler.countReads == beforeReads.1
+                    && tiler.combinedReads == beforeReads.2 + 1 && layout.updatedCounts.last! == 2 && tiler.tileCount == 0,
+                    "Open layout panel repeated discovery or rearranged unchanged windows")
+        tiler.topology = nil
+        events.change(.geometry); pump()
+        try require(layout.updatedCounts.last! == nil && tiler.tileCount == 0,
+                    "Unknown combined discovery displayed zero or rearranged windows")
+        tiler.topology = "initial"
+        UserDefaults.standard.set(false, forKey: "autoRetile")
+        beforeReads = (tiler.topologyReads, tiler.countReads, tiler.combinedReads)
+        events.change(.geometry); pump()
+        try require(tiler.topologyReads == beforeReads.0 && tiler.combinedReads == beforeReads.2
+                    && tiler.countReads == beforeReads.1 + 1 && tiler.tileCount == 0,
+                    "Paused automatic tiling changed its baseline while updating panel count")
+        UserDefaults.standard.set(true, forKey: "autoRetile")
+        layout.isVisible = false
+        print("PASS: layout count and automatic baseline share one fresh scan, including unknown state")
         var saved = preset("Saved")
         try require(panel.onSaveNew?(saved) == true && panel.activeID == saved.id, "Save did not activate")
         try require(windows.applyCount == 0 && tiler.tileCount == 0, "Save moved already captured windows")
+        layout.isVisible = true
+        beforeReads = (tiler.topologyReads, tiler.countReads, tiler.combinedReads)
+        events.change(.geometry); pump()
+        try require(tiler.topologyReads == beforeReads.0 && tiler.combinedReads == beforeReads.2
+                    && tiler.countReads == beforeReads.1 + 1 && panel.activeID == saved.id,
+                    "Preset panel count path changed the automatic topology or preset state")
+        layout.isVisible = false
         print("PASS: save activates without placement")
 
         var inactive = existing

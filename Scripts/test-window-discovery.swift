@@ -5,7 +5,10 @@ import WindowTilerCore
 struct TestApp {
     let processIdentifier: pid_t
     var isHidden = false
-    let activationPolicy = NSApplication.ActivationPolicy.regular
+    var activationPolicy: NSApplication.ActivationPolicy {
+        TestOS.policyReads[processIdentifier, default: 0] += 1
+        return .regular
+    }
     let isTerminated = false
     let localizedName: String? = "Test app"
     let bundleIdentifier: String? = "test.discovery"
@@ -27,6 +30,8 @@ enum TestOS {
     static var retained: [AXUIElement] = []
     static var roots: [pid_t: Int] = [:]
     static var reads: [pid_t: Int] = [:]
+    static var policyReads: [pid_t: Int] = [:]
+    static var cgReads = 0
     static var shown = [mainPID, hiddenPID]
     static func key(_ element: AXUIElement) -> UInt { UInt(bitPattern: Unmanaged.passUnretained(element).toOpaque()) }
     static func point(_ value: CGPoint) -> AXValue { var value = value; return AXValueCreate(.cgPoint, &value)! }
@@ -74,7 +79,8 @@ enum TestOS {
         fatalError("Discovery must never mutate a window")
     }
     static func cgList(_ options: CGWindowListOption, _ relative: CGWindowID) -> CFArray? {
-        shown.map { pid in [
+        cgReads += 1
+        return shown.map { pid in [
             kCGWindowOwnerPID as String: NSNumber(value: pid), kCGWindowLayer as String: 0,
             kCGWindowNumber as String: pid == mainPID ? 1 : 2,
             kCGWindowBounds as String: ["X": 0, "Y": 30, "Width": 800, "Height": 900]
@@ -92,11 +98,31 @@ let second = tiler.windowTopologySignature()
 check(second?.contains("\(TestOS.mainPID)@") == true, "fresh AX root sees replaced main tree without PID change")
 check(TestOS.roots[TestOS.mainPID] == 2, "one fresh local AX root per discovery scan")
 check(TestOS.roots[TestOS.offscreenPID] == nil && TestOS.roots[TestOS.hiddenPID] == nil, "offscreen and hidden apps receive no AX discovery calls")
+let backgroundPIDs = (999100..<999200).map { pid_t($0) }
+TestOS.runningApplications += backgroundPIDs.map { TestApp(processIdentifier: $0) }
+TestOS.policyReads = [:]
+let rootsBeforeSnapshot = TestOS.roots[TestOS.mainPID] ?? 0
+let readsBeforeSnapshot = TestOS.reads[TestOS.mainPID] ?? 0
+let cgBeforeSnapshot = TestOS.cgReads
+let snapshot = tiler.windowTopologyAndCounts()
+let snapshotAXReads = (TestOS.reads[TestOS.mainPID] ?? 0) - readsBeforeSnapshot
+check(snapshot?.signature == second && snapshot?.counts == [1], "one snapshot returns the same topology and display counts")
+check(TestOS.cgReads - cgBeforeSnapshot == 1 && (TestOS.roots[TestOS.mainPID] ?? 0) - rootsBeforeSnapshot == 1,
+      "combined panel and topology snapshot uses one CG list and one fresh AX root")
+check(TestOS.policyReads.count == 2 && TestOS.policyReads[TestOS.offscreenPID] == nil
+      && backgroundPIDs.allSatisfy { TestOS.policyReads[$0] == nil }, "102 offscreen apps receive no dynamic activation-policy queries")
+let readsBeforeSeparate = TestOS.reads[TestOS.mainPID] ?? 0
+_ = tiler.windowCountsPerScreen(); _ = tiler.windowTopologySignature()
+check((TestOS.reads[TestOS.mainPID] ?? 0) - readsBeforeSeparate == snapshotAXReads * 2,
+      "shared snapshot halves AX reads compared with separate panel and topology scans")
+print("MEASURE combined snapshot: \(snapshotAXReads) AX reads, 1 CG read; separate scans: \(snapshotAXReads * 2) AX reads, 2 CG reads; app policy queries: 2 of \(TestOS.runningApplications.count)")
 AppQuarantine.shared.add(TestOS.offscreenPID)
 check(tiler.windowCountsPerScreen() == [1], "offscreen quarantine does not block visible count")
+check(AppQuarantine.shared.contains(TestOS.offscreenPID), "offscreen live app keeps its quarantine until recovery or exit")
 check(tiler.windowTopologySignature()?.contains("\(TestOS.mainPID)@") == true, "offscreen quarantine does not block automatic topology")
 TestOS.shown.append(TestOS.hungPID)
 check(tiler.windowTopologySignature() == nil, "visible unresponsive app keeps topology unknown")
+check(tiler.windowTopologyAndCounts() == nil, "combined snapshot remains unknown while a visible app is quarantined")
 check(TestOS.reads[TestOS.hungPID] == 1, "first timeout stops all further reads to that app")
 TestOS.shown.removeAll { $0 == TestOS.hungPID }
 check(tiler.windowCountsPerScreen() == [1], "moving quarantined app offscreen restores visible discovery")

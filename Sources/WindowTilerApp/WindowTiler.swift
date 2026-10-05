@@ -610,6 +610,12 @@ final class WindowTiler {
     /// Nil when the visible-window list is unavailable, so the caller can
     /// treat the state as unknown instead of as a change.
     func windowTopologySignature() -> String? {
+        windowTopologyAndCounts()?.signature
+    }
+
+    /// One fresh scan serves both automatic change detection and the open
+    /// layout panel. No Accessibility handles survive between scans.
+    func windowTopologyAndCounts() -> (signature: String, counts: [Int])? {
         let screens = screenBoundsInAccessibilityCoordinates()
         guard let windows = eligibleWindows() else { return nil }
         rememberSlotsOfNewWindows(windows)
@@ -620,7 +626,7 @@ final class WindowTiler {
         // While an app is not answering, its windows cannot be listed, so
         // the true window set is unknown; report that rather than a change.
         guard !quarantine.intersects(visibleAppPIDs) else { return nil }
-        return signature
+        return (signature, counts(of: windows, on: screens))
     }
 
     /// Visible window count per screen, in `NSScreen.screens` order, for the
@@ -629,6 +635,10 @@ final class WindowTiler {
     func windowCountsPerScreen() -> [Int]? {
         let screens = screenBoundsInAccessibilityCoordinates()
         guard !screens.isEmpty, let windows = eligibleWindows(), !quarantine.intersects(visibleAppPIDs) else { return nil }
+        return counts(of: windows, on: screens)
+    }
+
+    private func counts(of windows: [Window], on screens: [CGRect]) -> [Int] {
         var counts = Array(repeating: 0, count: screens.count)
         for window in windows {
             if let index = ScreenGeometryEngine.screenIndex(for: window.center, screens: screens) {
@@ -716,13 +726,17 @@ final class WindowTiler {
     private func eligibleWindows() -> [Window]? {
         let ownPID = ProcessInfo.processInfo.processIdentifier
         guard let onScreen = onScreenWindowsByProcess() else { return nil }
-        let alive = NSWorkspace.shared.runningApplications.filter {
-            $0.activationPolicy == .regular && !$0.isTerminated && $0.processIdentifier != ownPID
-        }
+        let alive = NSWorkspace.shared.runningApplications
         // Per-app state outlives hiding; only a quit app is forgotten.
         let alivePIDs = Set(alive.map(\.processIdentifier))
         quarantine.forget(except: alivePIDs)
-        let running = alive.filter { !$0.isHidden && (onScreen[$0.processIdentifier] ?? []).contains { $0.bounds.width > 80 && $0.bounds.height > 80 } }
+        // Dynamic app properties can call LaunchServices synchronously. Check
+        // the already-read window-server list before asking about each app.
+        let running = alive.filter {
+            $0.processIdentifier != ownPID
+                && (onScreen[$0.processIdentifier] ?? []).contains { $0.bounds.width > 80 && $0.bounds.height > 80 }
+                && $0.activationPolicy == .regular && !$0.isTerminated && !$0.isHidden
+        }
         visibleAppPIDs = Set(running.map(\.processIdentifier))
 
         return running

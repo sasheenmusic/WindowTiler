@@ -39,6 +39,11 @@ source = pathlib.Path('Sources/WindowTilerApp/PresetWindowService.swift').read_t
 needle = '$0.activationPolicy == .regular && !$0.isTerminated'
 assert source.count(needle) == 1, 'Discovery isolation must match once'
 source = source.replace(needle, '(["com.windowtiler.foreground-target-fixture", "com.windowtiler.foreground-cover-fixture"].contains($0.bundleIdentifier ?? "")) && ' + needle)
+# Count the real service's geometry requests without adding production hooks.
+for signature in ['private func setPoint(_ point: CGPoint, on element: AXUIElement) -> Bool {',
+                  'private func setSize(_ size: CGSize, on element: AXUIElement) -> Bool {']:
+    assert source.count(signature) == 1, 'Geometry instrumentation must match once'
+    source = source.replace(signature, signature + '\n        PresetFixtureMetrics.geometryWrites += 1')
 (root/'PresetWindowService.swift').write_text(source)
 PY
 swiftc -emit-library -emit-module -module-name WindowTilerCore Sources/WindowTilerCore/*.swift \
