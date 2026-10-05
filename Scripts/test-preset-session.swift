@@ -128,11 +128,22 @@ final class PresetPanel {
     var activeID: UUID?
     var presets: [LayoutPreset] = []
     var errors: [String] = []
+    var isRecordingShortcut = false
     init() { Self.latest = self }
     func refresh(presets: [LayoutPreset], activeID: UUID?) { self.presets = presets; self.activeID = activeID }
     func showManage(presets: [LayoutPreset], activeID: UUID?) { refresh(presets: presets, activeID: activeID) }
     func showSave(screens: [PresetScreen], currentScreenID: String?) {}
     func showError(_ value: String) { errors.append(value) }
+}
+
+// Do not start Sparkle or touch update preferences in the coordinator fixture.
+final class AppUpdater {
+    static var latest: AppUpdater!
+    let isIdle: () -> Bool
+    var onWillRelaunch: (() -> Void)?
+    init(isIdle: @escaping () -> Bool, startAutomatically: Bool = true) { self.isIdle = isIdle; Self.latest = self }
+    func appendMenuItems(to menu: NSMenu) {}
+    func shutdown() {}
 }
 
 @main enum PresetSessionTests {
@@ -346,5 +357,35 @@ final class PresetPanel {
         try require(recoveredEvents.resetCount == 3 && recoveredTiler.tileCount == beforePermission && recoveredPanel.activeID == existing.id,
                     "Permission recovery rearranged or deactivated an active preset")
         print("PASS: permission polling preserves an active preset")
+
+        try require(recovering.applicationShouldTerminate(NSApp) == .terminateNow, "Idle app refused termination")
+        PresetWindowService.latest.isApplying = true
+        try require(recovering.applicationShouldTerminate(NSApp) == .terminateCancel, "Quit interrupted native layout cleanup")
+        PresetWindowService.latest.isApplying = false
+        try require(recovering.applicationShouldTerminate(NSApp) == .terminateNow, "Finished layout kept blocking termination")
+        print("PASS: manual update and quit wait for native layout cleanup")
+
+        AppUpdater.latest.onWillRelaunch?()
+        let marker = UserDefaults.standard.object(forKey: "updateResumePreset") as? [String: Any]
+        try require(marker?["presetID"] as? String == existing.id.uuidString && marker?["build"] as? String == "3",
+                    "Update restart did not save the active preset")
+        recovering.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+        WindowTiler.initialAccessibilityEnabled = true
+        PresetStore.saved = [existing]
+        for (oldBuild, age, shouldRestore) in [("2", 0.0, true), ("3", 0.0, false), ("2", 601.0, false)] {
+            UserDefaults.standard.set(["build": oldBuild, "savedAt": Date().timeIntervalSince1970 - age,
+                                       "presetID": existing.id.uuidString], forKey: "updateResumePreset")
+            let restarted = AppDelegate()
+            restarted.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+            _ = restarted.perform(NSSelectorFromString("managePresetsPressed"))
+            try require((PresetPanel.latest.activeID == existing.id) == shouldRestore,
+                        "Preset update restore did not honor version and age")
+            try require(WindowTiler.latest.tileCount == 0 && PresetWindowService.latest.applyCount == 0,
+                        "Update restart moved windows")
+            try require(UserDefaults.standard.object(forKey: "updateResumePreset") == nil,
+                        "Update restart marker was not consumed")
+            restarted.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+        }
+        print("PASS: update restart preserves the preset without moving windows; ordinary and stale restarts do not")
     }
 }

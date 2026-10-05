@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var autoRetileItem: NSMenuItem!
     private var swapByDraggingItem: NSMenuItem!
     private var dragSwap: DragSwapController?
+    private var appUpdater: AppUpdater?
     private let layoutPanel = LayoutPanel()
     private let presetPanel = PresetPanel()
     private let presetWindows = PresetWindowService()
@@ -58,6 +59,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         layoutPanel.onApply = { [weak self] plan in self?.applyHandPickedPlan(plan) }
         layoutPanel.onAutomatic = { [weak self] in self?.chooseAutomaticLayout() }
         configurePresets()
+        appUpdater = AppUpdater(isIdle: { [weak self] in
+            guard let self else { return false }
+            return !self.isTiling && !self.isOrdinaryTiling && !self.presetWindows.isApplying
+                && !self.presetPanel.isRecordingShortcut && NSApp.modalWindow == nil
+                && NSEvent.pressedMouseButtons == 0
+                && !NSApp.windows.contains { $0.isVisible && $0.level != .statusBar }
+        })
+        appUpdater?.onWillRelaunch = { [weak self] in self?.rememberPresetForUpdate() }
         buildMenu()
         selectShortcut(index: savedShortcutIndex(), interactive: false)
         selectWindowsPerRow(savedWindowsPerRow(), interactive: false)
@@ -72,7 +81,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Sparkle also asks here before a manual install. Do not cut off a
+        // window placement or asynchronous cross-desktop rollback in progress.
+        guard !isTiling, !isOrdinaryTiling, !presetWindows.isApplying else {
+            showPresetFeedback(["Wait for the current layout to finish, then quit or install the update again."])
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        appUpdater?.shutdown()
         applicationRevision += 1
         presetWindows.cancel()
         settleTimer?.invalidate()
@@ -153,6 +173,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let permissionItem = NSMenuItem(title: "Open Accessibility Settings…", action: #selector(openAccessibilitySettings), keyEquivalent: "")
         permissionItem.target = self
         menu.addItem(permissionItem)
+        menu.addItem(.separator())
+
+        // Menu construction already runs on AppKit's main thread.
+        MainActor.assumeIsolated { appUpdater?.appendMenuItems(to: menu) }
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit Window Tiler", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -535,6 +559,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configurePresets() {
         do { presets = try presetStore.load() }
         catch { presetLoadError = "Saved presets could not be read. The file has been left unchanged. \(error.localizedDescription)" }
+        restorePresetAfterUpdate()
         presetPanel.onSaveNew = { [weak self] in self?.savePreset($0, isNew: true) ?? false }
         presetPanel.onChange = { [weak self] in _ = self?.savePreset($0, isNew: false) }
         presetPanel.onDelete = { [weak self] in self?.deletePreset($0) }
@@ -551,6 +576,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if restored.contains(false) { self.showPresetFeedback(["A shortcut became unavailable. Choose another in Manage Presets."]) }
             }
         }
+    }
+
+    /// An updater restart should keep automatic tiling paused without moving windows.
+    /// Consume this once, and only after the app version actually increased.
+    private func restorePresetAfterUpdate() {
+        let key = "updateResumePreset"
+        let marker = UserDefaults.standard.object(forKey: key) as? [String: Any]
+        UserDefaults.standard.set(nil, forKey: key)
+        guard let marker,
+              let previousBuild = marker["build"] as? String,
+              let currentBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              currentBuild.compare(previousBuild, options: .numeric) == .orderedDescending,
+              let savedAt = marker["savedAt"] as? Double,
+              (0...600).contains(Date().timeIntervalSince1970 - savedAt),
+              let rawID = marker["presetID"] as? String,
+              let id = UUID(uuidString: rawID), presets.contains(where: { $0.id == id }) else { return }
+        activePresetID = id
+    }
+
+    private func rememberPresetForUpdate() {
+        guard let activePresetID,
+              let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String else {
+            UserDefaults.standard.set(nil, forKey: "updateResumePreset")
+            return
+        }
+        UserDefaults.standard.set(["build": build, "savedAt": Date().timeIntervalSince1970,
+                                   "presetID": activePresetID.uuidString], forKey: "updateResumePreset")
     }
 
     private func shortcutConflict(_ shortcut: PresetShortcut, excluding id: UUID?) -> String? {

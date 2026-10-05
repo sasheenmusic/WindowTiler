@@ -13,6 +13,7 @@ cat > "$test_app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>local.WindowTiler.PresetSessionTests</string>
 <key>CFBundleName</key><string>Preset Session Tests</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>3</string>
 </dict></plist>
 PLIST
 build_root=$(swift build --disable-sandbox --show-bin-path)

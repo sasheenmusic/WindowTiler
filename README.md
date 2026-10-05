@@ -8,10 +8,25 @@ Turn your open windows into a tidy, edge-to-edge layout. Window Tiler is a small
 
 ## Install
 
-1. Download the ZIP from the [latest release](../../releases/latest).
-2. Unzip it and move **Window Tiler.app** to **Applications**.
-3. Right-click the app and choose **Open**. If macOS blocks it, go to **System Settings → Privacy & Security → Open Anyway**. The app is not notarized by Apple.
-4. Enable Window Tiler under **System Settings → Privacy & Security → Accessibility** so it can move and resize windows.
+Paste this into Terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sasheenmusic/WindowTiler/main/install.sh | bash
+```
+
+The installer downloads the latest release, checks its checksum and code signature, and opens it. It updates your existing copy in **Applications** or **~/Applications**, keeping your settings and presets. For a first install, it uses **Applications** when writable, otherwise **~/Applications**. It does not ask for `sudo`. Run the same command again to update.
+
+If macOS blocks opening, go to **System Settings → Privacy & Security → Open Anyway**, or right-click **Window Tiler.app** and choose **Open**. The app is not notarized by Apple. Enable Window Tiler under **System Settings → Privacy & Security → Accessibility** so it can move and resize windows.
+
+For a manual install, download the ZIP from the [latest release](../../releases/latest), unzip it, and move **Window Tiler.app** to **Applications**.
+
+## Updates
+
+Choose **Check for Updates…** in the menu bar to check now. **Automatically Install Updates** is on by default: the app checks daily, installs signed updates, and restarts itself when idle. Uncheck it to update manually. Settings and saved presets are kept. An update restart keeps the active preset selected without moving windows.
+
+Turning automatic updates off stops future downloads and automatic restarts. An update already downloaded may still install when you quit the app.
+
+Public builds use an ad-hoc code signature. macOS may require you to grant Accessibility access again after an update.
 
 ## Start tiling
 
@@ -49,7 +64,7 @@ Click a preset in the menu to activate it. Click it again to turn it off and res
 
 **Manage Presets…** shows a list, a read-only layout preview, app and screen checkboxes, and an optional shortcut recorder. Settings save automatically. Changes to an active preset take effect immediately; editing an inactive preset does not activate it. Arrange your actual windows and choose **Update from Current Windows** to replace the saved layout. Updating and deleting require confirmation.
 
-Presets remain saved after restarting Window Tiler, but none activates automatically. If an app cannot be launched or moved, the other slots are applied and a message names the app. Moving windows between Mac desktops relies on macOS interfaces that may change; Window Tiler verifies each move and reports failures.
+Presets remain saved after restarting Window Tiler, but a normal restart activates none. If an app cannot be launched or moved, the other slots are applied and a message names the app. Moving windows between Mac desktops relies on macOS interfaces that may change; Window Tiler verifies each move and reports failures.
 
 ## How windows are handled
 
@@ -104,11 +119,18 @@ swift build
 ./Scripts/test-preset-session.sh
 ./Scripts/test-window-discovery.sh
 ./Scripts/test-preset-boundaries.sh
+./Scripts/test-installer.sh
+./Scripts/test-updater.sh
+./Scripts/test-sparkle-bundle.sh
 swiftc Sources/WindowTilerApp/HotKey.swift Scripts/test-hotkeys.swift -o /tmp/windowtiler-hotkey-tests
 /tmp/windowtiler-hotkey-tests
 ```
 
 The session checks use in-memory settings and window stubs. The discovery checks simulate stale Accessibility handles, unresponsive apps, and temporary Electron flag cleanup; boundary checks cover capture filtering and shortcut recording through UI refreshes. The hotkey checks register temporary shortcuts and send events only within the test process. Neither moves your windows. Run these checks in a normal macOS login session.
+
+The installer checks use offline downloads, fake signatures, and launch stubs in a temporary directory. They never replace your installed app.
+
+The updater checks cover restart timing and menu settings. After building the app, `python3 Scripts/test-signed-updates.py` tests real signed upgrades, automatic relaunch, invalid signatures, and an already-current version using disposable apps. This requires the release key in Keychain and never runs the tiler or moves user windows. See [release instructions](Scripts/RELEASING.md) for packaging and signing.
 
 `./Scripts/test-preset-windows.sh` runs the native fixture checks, including restoration across desktops and cancellation. It requires Accessibility access, two existing Mac desktops, and any running Window Tiler instance to be paused or closed. It moves only its disposable test app and removes that app afterward.
 
