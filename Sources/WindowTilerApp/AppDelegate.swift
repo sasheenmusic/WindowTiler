@@ -27,6 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingWindowSetChange = false
     private var needsPermissionRetile = false
     private var lastAccessibilityEnabled = false
+    private var isShowingPermissionHelp = false
     private var spaceTransitionTimer: Timer?
     /// A layout the user picked in the panel. Active only while automatic
     /// re-tiling is off; ends by itself when the visible window set changes.
@@ -72,7 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectWindowsPerRow(savedWindowsPerRow(), interactive: false)
         registerPresetShortcuts()
 
-        let accessibilityEnabled = tiler.isAccessibilityEnabled(prompt: true)
+        let accessibilityEnabled = tiler.isAccessibilityEnabled(prompt: false)
         lastAccessibilityEnabled = accessibilityEnabled
         UserDefaults.standard.set(accessibilityEnabled, forKey: "diagnostics.accessibilityEnabled")
         startWindowMonitor()
@@ -291,7 +292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             applyPreset(activePresetID)
             return
         }
-        guard !isTiling, tiler.isAccessibilityEnabled(prompt: true) else {
+        guard !isTiling, tiler.isAccessibilityEnabled(prompt: false) else {
             if !tiler.isAccessibilityEnabled(prompt: false) { showPermissionHelp() }
             return
         }
@@ -312,7 +313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func performTile(showFeedback: Bool, relearn: Bool, reason: String) {
-        guard tiler.isAccessibilityEnabled(prompt: showFeedback) else {
+        guard tiler.isAccessibilityEnabled(prompt: false) else {
             if showFeedback { showPermissionHelp() }
             return
         }
@@ -801,7 +802,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyPreset(_ id: UUID) {
         guard let preset = presets.first(where: { $0.id == id }) else { return }
         if isOrdinaryTiling { queuedPresetID = id; return }
-        guard tiler.isAccessibilityEnabled(prompt: true) else { showPermissionHelp(); return }
+        guard tiler.isAccessibilityEnabled(prompt: false) else { showPermissionHelp(); return }
         cancelPresetApplication()
         let revision = applicationRevision
         activePresetID = id
@@ -856,10 +857,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Alerts
 
     private func showPermissionHelp() {
-        showAlert(
-            title: "Allow Window Tiler to move windows",
-            message: "In System Settings → Privacy & Security → Accessibility, turn on Window Tiler. Then use the shortcut again."
-        )
+        guard !isShowingPermissionHelp else { return }
+        isShowingPermissionHelp = true
+        defer { isShowingPermissionHelp = false }
+        if #available(macOS 14.0, *) { NSApp.activate() }
+        else { NSApp.activate(ignoringOtherApps: true) }
+        let alert = NSAlert()
+        alert.messageText = "Allow Window Tiler to move windows"
+        alert.informativeText = "Add this app in System Settings → Privacy & Security → Accessibility, then turn it on.\n\nAlready on? Quit Window Tiler, remove only its entry, add this app again, turn it on, and reopen it."
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Show This App")
+        alert.addButton(withTitle: "Later")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: openAccessibilitySettings()
+        case .alertSecondButtonReturn: NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+        default: break
+        }
     }
 
     private func showAlert(title: String, message: String) {

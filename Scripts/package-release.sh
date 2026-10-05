@@ -9,12 +9,16 @@ p = argparse.ArgumentParser(description='Stage a signed Sparkle release; never p
 p.add_argument('--app', default='dist/Window Tiler.app')
 p.add_argument('--output', help='New output directory (default: dist/releases/vVERSION-buildBUILD)')
 p.add_argument('--download-url', help='HTTPS ZIP URL (default: GitHub vVERSION release asset)')
+p.add_argument('--signing-identity', default=os.environ.get('WINDOW_TILER_PUBLIC_SIGNING_IDENTITY'),
+               help='Developer ID Application name or fingerprint for the fixed release team; no fallback')
 a = p.parse_args()
 app = pathlib.Path(a.app).resolve()
 tools = pathlib.Path('.build/artifacts/sparkle/Sparkle/bin').resolve()
 def run(*args, capture=False):
-    return subprocess.run([str(x) for x in args], check=True, text=True,
-                          stdout=subprocess.PIPE if capture else None).stdout
+    result = subprocess.run([str(x) for x in args], text=True,
+                            stdout=subprocess.PIPE if capture else None)
+    if result.returncode != 0: raise SystemExit(f'Release stopped: {pathlib.Path(str(args[0])).name} failed.')
+    return result.stdout
 def require(condition, message):
     if not condition: raise SystemExit(message)
 require(app.name == 'Window Tiler.app', 'Release app must be named Window Tiler.app.')
@@ -23,6 +27,9 @@ with (app / 'Contents/Info.plist').open('rb') as f: info = plistlib.load(f)
 version, build = info['CFBundleShortVersionString'], info['CFBundleVersion']
 require(re.fullmatch(r'[0-9]+(?:\.[0-9]+)*', version) and re.fullmatch(r'[0-9]+', build), 'Invalid release version/build.')
 require(info.get('CFBundleIdentifier') == 'com.windowtiler.app', 'Wrong application bundle.')
+identity_command = ['python3', 'Scripts/public-signing-policy.py', 'identity']
+if a.signing_identity is not None: identity_command += ['--signing-identity', a.signing_identity]
+public_identity = run(*identity_command, capture=True).strip()
 require(info.get('SURequireSignedFeed') is True and info.get('SUVerifyUpdateBeforeExtraction') is True, 'Release must require signed feeds and pre-extraction verification.')
 key = info.get('SUPublicEDKey', '')
 require(len(base64.b64decode(key, validate=True)) == 32, 'Missing or invalid public EdDSA key.')
@@ -38,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix='.windowtiler-release-', dir=output.pare
     stage = pathlib.Path(temp)
     public = stage / app.name
     run('/usr/bin/ditto', app, public)
-    run('Scripts/sign-app.sh', public, '-')
+    run('Scripts/sign-app.sh', public, public_identity, '--public')
     archive = stage / filename
     run('/usr/bin/ditto', '-c', '-k', '--norsrc', '--keepParent', public, archive)
     extracted = stage / 'verify'
@@ -46,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix='.windowtiler-release-', dir=output.pare
     check = extracted / app.name
     require((check / 'Contents/Frameworks/Sparkle.framework/Versions/Current').is_symlink(), 'ZIP lost framework symlinks.')
     run('/usr/bin/codesign', '--verify', '--deep', '--strict', check)
+    run('python3', 'Scripts/public-signing-policy.py', 'verify', check)
     with (check / 'Contents/Info.plist').open('rb') as f: require(plistlib.load(f) == info, 'Archive metadata changed.')
     signature = run(tools / 'sign_update', '--account', 'windowtiler', '-p', archive, capture=True).strip()
     require(len(base64.b64decode(signature, validate=True)) == 64, 'Invalid archive signature.')

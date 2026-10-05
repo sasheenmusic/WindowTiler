@@ -6,6 +6,8 @@ Turn your open windows into a tidy, edge-to-edge layout. Window Tiler is a small
 
 **Download requires Apple silicon and macOS 13 or later.** Released under the MIT license.
 
+Having trouble? See [Window Tiler help](TROUBLESHOOTING.md), including **Accessibility is on, but windows will not move**.
+
 ## Install
 
 Paste this into Terminal:
@@ -26,7 +28,7 @@ Choose **Check for Updates…** in the menu bar to check now. **Automatically In
 
 Turning automatic updates off stops future downloads and automatic restarts. An update already downloaded may still install when you quit the app.
 
-Public builds use an ad-hoc code signature. macOS may require you to grant Accessibility access again after an update.
+New public releases use a stable Developer ID signing identity. Upgrading from an older ad-hoc build may need one fresh Accessibility grant. See [the recovery steps](TROUBLESHOOTING.md). Later updates keep the same signing team and app identity; macOS still controls permissions.
 
 ## Start tiling
 
@@ -91,7 +93,7 @@ cd WindowTiler
 open "dist/Window Tiler.app"
 ```
 
-The build script uses an available Apple Development signing identity to help keep Accessibility trust across local rebuilds. For a public build without a developer certificate, use an ad-hoc signature:
+The build script uses an available Apple Development signing identity for local rebuilds. To build locally without a developer certificate, use an ad-hoc signature:
 
 ```bash
 WINDOW_TILER_SIGNING_IDENTITY=- ./Scripts/build-app.sh
@@ -99,9 +101,11 @@ WINDOW_TILER_SIGNING_IDENTITY=- ./Scripts/build-app.sh
 
 Ad-hoc builds may need Accessibility access granted again after a rebuild.
 
+Public release packaging requires the project's Developer ID Application identity and never falls back to a local development or ad-hoc signature. See [release instructions](Scripts/RELEASING.md).
+
 ## Troubleshooting
 
-**Windows do not move:** check **System Settings → Privacy & Security → Accessibility**.
+**Windows do not move:** check **System Settings → Privacy & Security → Accessibility**. If it is already on, follow [the recovery steps](TROUBLESHOOTING.md).
 
 **A window will not fit:** some apps enforce a minimum or maximum window size. Window Tiler works around these limits where possible.
 
@@ -122,6 +126,7 @@ swift build
 ./Scripts/test-window-discovery.sh
 ./Scripts/test-preset-boundaries.sh
 ./Scripts/test-installer.sh
+python3 Scripts/test-public-signing-policy.py
 ./Scripts/test-updater.sh
 ./Scripts/test-sparkle-bundle.sh
 swiftc Sources/WindowTilerApp/HotKey.swift Scripts/test-hotkeys.swift -o /tmp/windowtiler-hotkey-tests

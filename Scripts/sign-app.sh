@@ -1,10 +1,16 @@
 #!/bin/bash
 set -euo pipefail
-[[ $# -eq 2 ]] || { echo "Usage: sign-app.sh app-path signing-identity" >&2; exit 1; }
+[[ $# -eq 2 || ( $# -eq 3 && $3 == --public ) ]] || { echo "Usage: sign-app.sh app-path signing-identity [--public]" >&2; exit 1; }
 app="$1"
 identity="$2"
-sign=(codesign --force --timestamp=none --preserve-metadata=entitlements --sign "$identity")
-if [[ "$identity" != "-" ]]; then sign+=(--options runtime); fi
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+if [[ ${3:-} == --public ]]; then
+    identity=$(python3 "$script_dir/public-signing-policy.py" identity --signing-identity "$identity")
+    sign=(codesign --force --timestamp --options runtime --preserve-metadata=entitlements --sign "$identity")
+else
+    sign=(codesign --force --timestamp=none --preserve-metadata=entitlements --sign "$identity")
+    if [[ "$identity" != "-" ]]; then sign+=(--options runtime); fi
+fi
 framework="$app/Contents/Frameworks/Sparkle.framework"
 version="$framework/Versions/Current"
 [[ -f "$app/Contents/Info.plist" && -L "$version" ]] || { echo "Missing app or versioned Sparkle framework." >&2; exit 1; }
@@ -14,3 +20,4 @@ for component in "$version/XPCServices/Downloader.xpc" "$version/XPCServices/Ins
     "${sign[@]}" "$component"
 done
 codesign --verify --deep --strict "$app"
+if [[ ${3:-} == --public ]]; then python3 "$script_dir/public-signing-policy.py" verify "$app"; fi

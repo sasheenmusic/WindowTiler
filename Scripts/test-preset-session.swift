@@ -42,10 +42,28 @@ final class DistributedNotificationCenter {
     func postNotificationName(_ name: Notification.Name, object: String?, userInfo: [AnyHashable: Any]?, deliverImmediately: Bool) {}
 }
 final class NSAlert {
+    static var presentations: [(title: String, message: String, buttons: [String])] = []
+    static var response: NSApplication.ModalResponse = .alertThirdButtonReturn
+    static var onRunModal: (() -> Void)?
     var messageText = ""
     var informativeText = ""
-    func addButton(withTitle title: String) {}
-    @discardableResult func runModal() -> NSApplication.ModalResponse { .alertFirstButtonReturn }
+    var buttons: [String] = []
+    func addButton(withTitle title: String) { buttons.append(title) }
+    @discardableResult func runModal() -> NSApplication.ModalResponse {
+        Self.presentations.append((messageText, informativeText, buttons))
+        let callback = Self.onRunModal
+        Self.onRunModal = nil
+        callback?()
+        return Self.response
+    }
+}
+// Recovery actions are recorded only; Settings and Finder never open in tests.
+final class NSWorkspace {
+    static let shared = NSWorkspace()
+    var openedURLs: [URL] = []
+    var revealedURLs: [[URL]] = []
+    @discardableResult func open(_ url: URL) -> Bool { openedURLs.append(url); return true }
+    func activateFileViewerSelecting(_ urls: [URL]) { revealedURLs.append(urls) }
 }
 
 final class WindowTiler {
@@ -54,11 +72,12 @@ final class WindowTiler {
     var windowsPerRow = 2
     var accessibilityEnabled: Bool
     var resetCount = 0
+    var systemPromptCount = 0
     var topology: String? = "initial"
     var tileCount = 0
     var onTile: (() -> Void)?
     init() { accessibilityEnabled = Self.initialAccessibilityEnabled; Self.latest = self }
-    func isAccessibilityEnabled(prompt: Bool) -> Bool { accessibilityEnabled }
+    func isAccessibilityEnabled(prompt: Bool) -> Bool { if prompt { systemPromptCount += 1 }; return accessibilityEnabled }
     func resetAccessibilityState() { resetCount += 1 }
     func windowTopologySignature() -> String? { topology }
     func windowCountsPerScreen() -> [Int]? { [2] }
@@ -331,11 +350,30 @@ final class AppUpdater {
         delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
         WindowTiler.initialAccessibilityEnabled = false
         let recovering = AppDelegate()
+        let alertsBeforeDenied = NSAlert.presentations.count
+        NSAlert.onRunModal = { _ = recovering.perform(NSSelectorFromString("tileWindows")) }
         recovering.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
         defer { recovering.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification)) }
         let recoveredTiler = WindowTiler.latest!, recoveredEvents = WindowEventMonitor.latest!, recoveredPanel = PresetPanel.latest!
         try require(!UserDefaults.standard.bool(forKey: "diagnostics.accessibilityEnabled") && recoveredTiler.tileCount == 0,
                     "Untrusted startup moved windows or recorded access")
+        try require(NSAlert.presentations.count == alertsBeforeDenied + 1 && recoveredTiler.systemPromptCount == 0,
+                    "Permission callbacks opened duplicate alerts or requested a second system prompt")
+        try require(NSAlert.presentations.last?.message.contains("remove only its entry") == true,
+                    "Permission recovery did not explain an already-enabled entry")
+        let deniedWindows = PresetWindowService.latest!
+        NSAlert.response = .alertFirstButtonReturn
+        recoveredPanel.onApply?(existing.id)
+        try require(NSWorkspace.shared.openedURLs.last?.absoluteString == "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                    "Permission action did not open Accessibility Settings")
+        NSAlert.response = .alertSecondButtonReturn
+        recoveredPanel.onApply?(existing.id)
+        try require(NSWorkspace.shared.revealedURLs.last == [Bundle.main.bundleURL],
+                    "Permission recovery revealed an assumed installation instead of the running app")
+        try require(deniedWindows.applyCount == 0 && recoveredPanel.activeID == nil && recoveredTiler.systemPromptCount == 0,
+                    "Denied preset actions bypassed permission or requested duplicate system prompts")
+        NSAlert.response = .alertThirdButtonReturn
+        print("PASS: permission recovery uses one alert, correct actions, and the actual running app")
         recoveredTiler.accessibilityEnabled = true
         recoveredEvents.change(.geometry); pump()
         try require(recoveredTiler.resetCount == 1 && recoveredEvents.resetCount == 1,
