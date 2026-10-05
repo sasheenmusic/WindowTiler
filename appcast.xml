@@ -5,16 +5,16 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <title>Window Tiler Updates</title>
     <link>https://raw.githubusercontent.com/sasheenmusic/WindowTiler/main/appcast.xml</link>
     <item>
-      <title>Window Tiler 1.2.0</title>
-      <pubDate>Mon, 05 Oct 2026 16:38:11 +0000</pubDate>
-      <sparkle:version>3</sparkle:version>
-      <sparkle:shortVersionString>1.2.0</sparkle:shortVersionString>
+      <title>Window Tiler 1.2.1</title>
+      <pubDate>Mon, 05 Oct 2026 20:31:11 +0000</pubDate>
+      <sparkle:version>4</sparkle:version>
+      <sparkle:shortVersionString>1.2.1</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
       <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-      <enclosure url="https://github.com/sasheenmusic/WindowTiler/releases/download/v1.2.0/Window-Tiler-1.2.0.zip" length="2959229" type="application/octet-stream" sparkle:edSignature="rzmMKXwn9a8t/KgQS/dQbBCUmfj+TKRsHw6z1d05RLGebtdXOLdt7NtbVAjK9D5nQUTMFicCAPEJrTDfHnefAQ=="></enclosure>
+      <enclosure url="https://github.com/sasheenmusic/WindowTiler/releases/download/v1.2.1/Window-Tiler-1.2.1.zip" length="2963999" type="application/octet-stream" sparkle:edSignature="yX9mY+znwmAd2Cy6i2rEoQ5Yj5F8utfyEb/LmG2G3BVGve1CXzYH+EvM8eHLKxPwvy25Q80ezP5eINpxNDMXCQ=="></enclosure>
     </item>
   </channel>
 </rss><!-- sparkle-signatures:
-edSignature: nQYW+1KwDElGLXyMDms3oe5ERb0ojVK48HqVlx/J5xf2HC+Wr+AB63lKtH9PaRfOSwiyewW3U9AbvKGjdYcgCg==
+edSignature: xtDd04oC/RtIgoypJRpYF943wpPYBvH45vtKqDbDIWfz45NTm5skxvIAYu7kB1ZjPk8XsGIw/Rx1FNKx9ReXCg==
 length: 1208
 -->
