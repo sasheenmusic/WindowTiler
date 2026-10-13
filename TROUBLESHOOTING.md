@@ -18,6 +18,15 @@ macOS may ask you to unlock these settings. Follow its normal prompt. You do not
 
 The first Developer ID release changes identity from older builds, so you may need this one fresh grant. Later releases keep the same signing team and app identity to help preserve access. macOS still controls permission and may ask again.
 
+## An app is never tiled
+
+Window Tiler skips some windows on purpose. Click the menu bar icon and check two things.
+
+1. **Never Tile.** Open this submenu. A checkmark means the app is on your list and all of its windows are left alone. Click the app to remove the checkmark.
+2. **Leave Agent and Debug Windows Alone.** While it is checked, Window Tiler skips apps that another program started (for example from Terminal or by an AI coding assistant) and the "… (DEBUG)" game window that Godot's editor opens. The first line of the **Never Tile** submenu names what is being skipped right now, such as "Godot (debug run)". Uncheck **Leave Agent and Debug Windows Alone** to tile those windows again.
+
+Tile All Windows and saved presets skip these windows too. An app a script starts with `open -a` looks like one you opened yourself, so to skip it, check it in **Never Tile**.
+
 ## Check for an old or duplicate copy
 
 Quit any open Window Tiler copies. In Finder, check **Applications**, **~/Applications**, and **Downloads**. Keep using the latest installed app from one location. If the installer reports two installed copies, remove the older duplicate before running it again. Your settings and saved presets are separate from the app.

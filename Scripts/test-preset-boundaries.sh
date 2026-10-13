@@ -10,9 +10,11 @@ fi
 build_root=$(swift build --disable-sandbox --show-bin-path)
 service_sources=(Sources/WindowTilerApp/PresetWindowService.swift Sources/WindowTilerApp/PresetSpaceBridge.swift
   Sources/WindowTilerApp/PresetPrivateSymbol.swift Sources/WindowTilerApp/AppQuarantine.swift
-  Sources/WindowTilerApp/EnhancedUIState.swift Sources/WindowTilerApp/Log.swift)
+  Sources/WindowTilerApp/EnhancedUIState.swift Sources/WindowTilerApp/Log.swift
+  Sources/WindowTilerApp/WindowExclusions.swift Sources/WindowTilerApp/ProcessFacts.swift)
 swiftc -I "$build_root/Modules" "${service_sources[@]}" Scripts/test-preset-discovery.swift \
   "$build_root/WindowTilerCore.build/PresetModels.swift.o" "$build_root/WindowTilerCore.build/ScreenGeometryEngine.swift.o" \
+  "$build_root/WindowTilerCore.build/WindowExclusionPolicy.swift.o" \
   -o "$test_root/discovery" -framework AppKit -framework Carbon
 "$test_root/discovery" | tee "$test_root/discovery.txt"
 test_app="$test_root/PresetUITests.app"

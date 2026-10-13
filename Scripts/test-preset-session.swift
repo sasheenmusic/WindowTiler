@@ -29,10 +29,15 @@ final class PresetStore {
 final class NSStatusBar {
     static let system = NSStatusBar()
     static let squareLength: CGFloat = 24
-    func statusItem(withLength length: CGFloat) -> NSStatusItem { NSStatusItem() }
+    func statusItem(withLength length: CGFloat) -> NSStatusItem {
+        let item = NSStatusItem()
+        NSStatusItem.latest = item
+        return item
+    }
 }
 final class NSStatusItem {
     static let squareLength: CGFloat = 24
+    static var latest: NSStatusItem!
     var button: NSStatusBarButton? { nil }
     var menu: NSMenu?
 }
@@ -100,12 +105,25 @@ final class WindowEventMonitor {
     let onChange: (Change) -> Void
     let spaceChange: () -> Void
     var resetCount = 0
+    var refreshCount = 0
     init(onChange: @escaping (Change) -> Void, onSpaceChange: @escaping () -> Void, onWindowMoved: @escaping (AXUIElement) -> Void) {
         self.onChange = onChange; spaceChange = onSpaceChange; Self.latest = self
     }
     func change(_ kind: Change = .windowSet) { onChange(kind) }
-    func refresh() {}
+    func refresh() { refreshCount += 1 }
     func reset() { resetCount += 1; refresh() }
+}
+// The real filter reads other processes and the window server. This one only
+// records the settings the menu hands it and serves the apps a test chooses.
+final class WindowExclusions {
+    static let shared = WindowExclusions()
+    struct Overview {
+        var choices: [WindowExclusionPolicy.AppChoice] = []
+        var leftAlone: [String] = []
+    }
+    var settings = WindowExclusionPolicy.Settings()
+    var nextOverview = Overview()
+    func overview() -> Overview { nextOverview }
 }
 final class DragSwapController {
     var isEnabled = false
@@ -200,6 +218,15 @@ final class AppUpdater {
         try require(SetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
                                       MemoryLayout<EventHotKeyID>.size, &id) == noErr, "Could not set hotkey ID")
         try require(SendEventToEventTarget(event, GetApplicationEventTarget()) == noErr, "Hotkey callback not delivered")
+    }
+    static func menuItem(_ title: String) -> NSMenuItem? {
+        NSStatusItem.latest.menu?.items.first { $0.title == title }
+    }
+    /// Opens the Never Tile submenu the way AppKit does, through its delegate.
+    static func openNeverTile() throws -> NSMenu {
+        guard let submenu = menuItem("Never Tile")?.submenu else { throw Failure(description: "No Never Tile submenu") }
+        submenu.delegate?.menuNeedsUpdate?(submenu)
+        return submenu
     }
     static func busy(_ delegate: AppDelegate) -> Bool {
         Mirror(reflecting: delegate).children.first { $0.label == "isTiling" }?.value as? Bool ?? false
@@ -463,5 +490,81 @@ final class AppUpdater {
             restarted.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
         }
         print("PASS: update restart preserves the preset without moving windows; ordinary and stale restarts do not")
+        try checkWindowsLeftAlone()
+    }
+
+    /// Windows left alone: the menu, what it saves, and the single window-change
+    /// check. A fresh app launch, so its counters start from zero.
+    static func checkWindowsLeftAlone() throws {
+        PresetStore.saved = []
+        let delegate = AppDelegate()
+        delegate.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+        let tiler = WindowTiler.latest!, events = WindowEventMonitor.latest!, exclusions = WindowExclusions.shared
+        let toggle = menuItem("Leave Agent and Debug Windows Alone")
+        try require(toggle?.state == .on && exclusions.settings == WindowExclusionPolicy.Settings()
+                    && UserDefaults.standard.object(forKey: "leaveAgentWindowsAlone") == nil,
+                    "Leaving agent windows alone did not start on with an empty Never Tile list")
+        NSStatusItem.latest.menu?.update()
+        try require(menuItem("Never Tile")?.isEnabled == true && menuItem("Never Tile")?.submenu?.delegate != nil,
+                    "Never Tile is not an enabled submenu that fills itself when opened")
+        exclusions.nextOverview = .init(
+            choices: [.init(bundleIdentifier: "com.apple.Safari", name: "Safari"), .init(bundleIdentifier: "org.godotengine.godot", name: "Godot")],
+            leftAlone: ["Chromium (started by another program)", "Godot (debug run)"])
+        var neverTile = try openNeverTile()
+        try require(neverTile.items.map(\.title) == ["Leaving alone now: Chromium (started by another program), Godot (debug run)", "", "Safari", "Godot"]
+                    && neverTile.items[1].isSeparatorItem && !neverTile.items[0].isEnabled && neverTile.items.dropFirst(2).allSatisfy { $0.state == .off },
+                    "Never Tile menu did not show the automatic exclusions, then each app unchecked")
+        exclusions.nextOverview.leftAlone = []
+        neverTile = try openNeverTile()
+        try require(neverTile.items[0].title == "No agent or debug windows open", "Empty exclusion line was not explained")
+
+        var readsBeforeChoice = tiler.topologyReads, refreshesBeforeChoice = events.refreshCount
+        _ = delegate.perform(NSSelectorFromString("neverTileSelected:"), with: neverTile.items[2])
+        pump()
+        try require(UserDefaults.standard.object(forKey: "neverTileBundleIdentifiers") as? [String] == ["com.apple.Safari"]
+                    && exclusions.settings.neverTileBundleIdentifiers == ["com.apple.Safari"],
+                    "Never Tile choice was not saved and applied")
+        try require(tiler.topologyReads == readsBeforeChoice + 1 && events.refreshCount == refreshesBeforeChoice + 1 && tiler.tileCount == 0,
+                    "Unchanged windows should cost one check and observer refresh, with no tiling")
+        neverTile = try openNeverTile()
+        try require(neverTile.items[2].state == .on && neverTile.items[3].state == .off, "Never Tile checkmark did not follow the saved choice")
+
+        tiler.topology = "Safari no longer counted"
+        _ = delegate.perform(NSSelectorFromString("neverTileSelected:"), with: neverTile.items[3])
+        pump()
+        try require(tiler.tileCount == 1 && exclusions.settings.neverTileBundleIdentifiers == ["com.apple.Safari", "org.godotengine.godot"],
+                    "A changed window set did not tile exactly once")
+        pump()
+        try require(tiler.tileCount == 1, "Window-change check tiled twice")
+        for item in [neverTile.items[2], neverTile.items[3]] { _ = delegate.perform(NSSelectorFromString("neverTileSelected:"), with: item) }
+        pump()
+        try require(UserDefaults.standard.object(forKey: "neverTileBundleIdentifiers") as? [String] == [] && exclusions.settings == WindowExclusionPolicy.Settings(),
+                    "Choosing a checked app did not take it off the list")
+
+        readsBeforeChoice = tiler.topologyReads; refreshesBeforeChoice = events.refreshCount
+        let tilesBeforeToggle = tiler.tileCount
+        _ = delegate.perform(NSSelectorFromString("toggleLeaveAgentWindowsAlone"))
+        pump()
+        try require(toggle?.state == .off && UserDefaults.standard.bool(forKey: "leaveAgentWindowsAlone") == false
+                    && !exclusions.settings.leaveAgentWindowsAlone, "Turning the toggle off was not saved and applied")
+        try require(tiler.topologyReads == readsBeforeChoice + 1 && events.refreshCount == refreshesBeforeChoice + 1 && tiler.tileCount == tilesBeforeToggle,
+                    "Toggle with unchanged windows should check once and not tile")
+        neverTile = try openNeverTile()
+        try require(neverTile.items[0].title == "Automatic rule is turned off", "Menu claimed automatic exclusions while the rule is off")
+        _ = delegate.perform(NSSelectorFromString("toggleLeaveAgentWindowsAlone"))
+        pump()
+        try require(toggle?.state == .on && exclusions.settings.leaveAgentWindowsAlone, "Turning the toggle back on was not applied")
+        delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+        print("PASS: windows-left-alone menu saves its choices, applies them, and checks for window changes once")
+
+        UserDefaults.standard.set(false, forKey: "leaveAgentWindowsAlone")
+        UserDefaults.standard.set(["org.example.saved"], forKey: "neverTileBundleIdentifiers")
+        let relaunched = AppDelegate()
+        relaunched.applicationDidFinishLaunching(Notification(name: NSApplication.didFinishLaunchingNotification))
+        defer { relaunched.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification)) }
+        try require(exclusions.settings == WindowExclusionPolicy.Settings(leaveAgentWindowsAlone: false, neverTileBundleIdentifiers: ["org.example.saved"])
+                    && menuItem("Leave Agent and Debug Windows Alone")?.state == .off,
+                    "Saved windows-left-alone choices were not applied at launch")
+        print("PASS: saved windows-left-alone choices apply at launch")
     }
 }

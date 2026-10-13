@@ -74,6 +74,7 @@ final class PresetWindowService {
     private var cleanupRun: Run?
     private let quarantine = AppQuarantine.shared
     private let enhancedUI = EnhancedUIState.shared
+    private let exclusions = WindowExclusions.shared
     private var enhancedLeases = Set<EnhancedUIState.Lease>()
     private var spaceObserver: NSObjectProtocol?
     var isApplying: Bool { active != nil || cleanupRun != nil }
@@ -199,6 +200,7 @@ final class PresetWindowService {
                       let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value, !known.contains(id),
                       let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
                       let frame = CGRect(dictionaryRepresentation: dictionary), frame.width > 80, frame.height > 80,
+                      canPull(info, of: app),
                       let screen = screenFor(frame, among: connected), let destination = spaces.activeDesktop(on: screen.id),
                       let membership = spaces.spaces(of: id), membership.count == 1, let source = membership.first,
                       source != destination, spaces.isUserDesktop(source), spaces.nonMinimizedWindows(on: source)?.contains(id) == true else { continue }
@@ -289,10 +291,20 @@ final class PresetWindowService {
         }
         if let window = work.window { restore(window, work: work, run: run); return }
         guard let binding = work.binding else { next(run); return }
-        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: binding.bundleID).first {
+        // A Godot editor and the game it runs share a bundle identifier, so
+        // the first running copy may be one that is left alone.
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: binding.bundleID)
+        if let app = running.first(where: { !isExcluded($0) }) {
             guard app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
                   app.activationPolicy == .regular else { failed(run, work, "App has no normal desktop window."); return }
             findWindow(app, work: work, run: run, deadline: Date().addingTimeInterval(1)); return
+        }
+        // Opening an app that is already running only activates it, and
+        // every running copy here is one that must not be moved.
+        guard running.isEmpty else { failed(run, work, "App is left alone by Window Tiler."); return }
+        // Launching an app on the Never Tile list would only fail afterwards.
+        guard !exclusions.settings.neverTileBundleIdentifiers.contains(binding.bundleID) else {
+            failed(run, work, "App is left alone by Window Tiler."); return
         }
         guard work.launch else { failed(run, work, "App is not running."); return }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: binding.bundleID) else {
@@ -305,6 +317,7 @@ final class PresetWindowService {
             DispatchQueue.main.async {
                 guard let self, self.active === run else { return }
                 guard let app, error == nil else { self.failed(run, work, "App could not launch."); return }
+                guard !self.isExcluded(app) else { self.failed(run, work, "App is left alone by Window Tiler."); return }
                 self.later(run, delay: 0.4) { $0.findWindow(app, work: work, run: run, deadline: Date().addingTimeInterval(8)) }
             }
         }
@@ -349,7 +362,8 @@ final class PresetWindowService {
                   (info[kCGWindowLayer as String] as? Int) == 0,
                   let number = info[kCGWindowNumber as String] as? NSNumber,
                   let dictionary = info[kCGWindowBounds as String] as? NSDictionary,
-                  let frame = CGRect(dictionaryRepresentation: dictionary), frame.width > 80, frame.height > 80 else { return nil }
+                  let frame = CGRect(dictionaryRepresentation: dictionary), frame.width > 80, frame.height > 80,
+                  canPull(info, of: app) else { return nil }
             return number.uint32Value
         }
         let selected: CGWindowID?
@@ -661,8 +675,20 @@ final class PresetWindowService {
     private func runningApps() -> [NSRunningApplication] {
         NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && !$0.isTerminated && $0.processIdentifier != ProcessInfo.processInfo.processIdentifier
-                && $0.bundleIdentifier != Bundle.main.bundleIdentifier
+                && $0.bundleIdentifier != Bundle.main.bundleIdentifier && !isExcluded($0)
         }.sorted { $0.processIdentifier < $1.processIdentifier }
+    }
+    private func isExcluded(_ app: NSRunningApplication) -> Bool {
+        exclusions.isExcluded(pid: app.processIdentifier, bundleIdentifier: app.bundleIdentifier)
+    }
+    /// A window on another desktop is known only to the window server, whose
+    /// titles need Screen Recording access that this app does not have. For
+    /// an app whose windows are judged by title, an unreadable title means
+    /// the window cannot be judged, so it is not pulled across desktops.
+    private func canPull(_ info: [String: Any], of app: NSRunningApplication) -> Bool {
+        guard exclusions.readsWindowTitles(of: app.bundleIdentifier) else { return true }
+        guard let title = info[kCGWindowName as String] as? String else { return false }
+        return !exclusions.isExcludedWindow(titled: title, bundleIdentifier: app.bundleIdentifier)
     }
     /// Both lists come from the same snapshot, before any Accessibility calls.
     /// A background app with no shown normal-layer window must not delay Save.
@@ -716,6 +742,11 @@ final class PresetWindowService {
             guard identifier != "open-panel", identifier != "save-panel" else { return nil }
             if app.bundleIdentifier == "com.electron.wispr-flow",
                attribute(kAXTitleAttribute, element) as? String == "Status" { return nil }
+            // A "(DEBUG)" window of Godot's editor is never captured, restored,
+            // or picked as the editor's one window; the editor's own is.
+            if exclusions.readsWindowTitles(of: app.bundleIdentifier),
+               exclusions.isExcludedWindow(titled: attribute(kAXTitleAttribute, element) as? String,
+                                           bundleIdentifier: app.bundleIdentifier) { return nil }
             guard restoring || (bool(kAXMinimizedAttribute, element) != true && bool("AXFullScreen", element) != true),
                   let frame = frame(element), frame.width > 80, frame.height > 80,
                   let id = number(element) else { return nil }

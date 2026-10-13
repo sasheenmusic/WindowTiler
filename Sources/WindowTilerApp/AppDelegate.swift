@@ -1,7 +1,7 @@
 import AppKit
 import WindowTilerCore
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let tiler = WindowTiler()
     private var statusItem: NSStatusItem!
     private var hotKeyManager: HotKeyManager!
@@ -10,6 +10,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowsPerRowItems: [NSMenuItem] = []
     private var autoRetileItem: NSMenuItem!
     private var swapByDraggingItem: NSMenuItem!
+    private var leaveAgentWindowsItem: NSMenuItem!
+    private var neverTileMenu: NSMenu!
     private var dragSwap: DragSwapController?
     private var appUpdater: AppUpdater?
     private let layoutPanel = LayoutPanel()
@@ -49,6 +51,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let autoRetileDefaultsKey = "autoRetile"
     private let windowsPerRowDefaultsKey = "windowsPerRow"
     private let swapByDraggingDefaultsKey = "swapByDragging"
+    private let leaveAgentWindowsDefaultsKey = "leaveAgentWindowsAlone"
+    private let neverTileDefaultsKey = "neverTileBundleIdentifiers"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.app.notice("Window Tiler launched")
@@ -68,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 && !NSApp.windows.contains { $0.isVisible && $0.level != .statusBar }
         })
         appUpdater?.onWillRelaunch = { [weak self] in self?.rememberPresetForUpdate() }
+        applyExclusionSettings()
         buildMenu()
         selectShortcut(index: savedShortcutIndex(), interactive: false)
         selectWindowsPerRow(savedWindowsPerRow(), interactive: false)
@@ -118,6 +123,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         swapByDraggingItem.target = self
         swapByDraggingItem.state = isSwapByDraggingEnabled ? .on : .off
         menu.addItem(swapByDraggingItem)
+
+        leaveAgentWindowsItem = NSMenuItem(title: "Leave Agent and Debug Windows Alone", action: #selector(toggleLeaveAgentWindowsAlone), keyEquivalent: "")
+        leaveAgentWindowsItem.target = self
+        leaveAgentWindowsItem.state = isLeavingAgentWindowsAlone ? .on : .off
+        menu.addItem(leaveAgentWindowsItem)
+
+        // Filled in when the submenu opens, so it lists the apps open then.
+        neverTileMenu = NSMenu(title: "Never Tile")
+        neverTileMenu.delegate = self
+        let neverTileItem = NSMenuItem(title: "Never Tile", action: nil, keyEquivalent: "")
+        neverTileItem.submenu = neverTileMenu
+        menu.addItem(neverTileItem)
 
         let layoutItem = NSMenuItem(title: "Choose Layout…", action: #selector(openLayoutPanel), keyEquivalent: "")
         layoutItem.target = self
@@ -249,6 +266,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             userInfo: ["reason": reason],
             deliverImmediately: true
         )
+    }
+
+    // MARK: - Windows left alone
+
+    private var isLeavingAgentWindowsAlone: Bool {
+        if UserDefaults.standard.object(forKey: leaveAgentWindowsDefaultsKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: leaveAgentWindowsDefaultsKey)
+    }
+
+    private var neverTileBundleIdentifiers: Set<String> {
+        Set(UserDefaults.standard.object(forKey: neverTileDefaultsKey) as? [String] ?? [])
+    }
+
+    private func applyExclusionSettings() {
+        WindowExclusions.shared.settings = WindowExclusionPolicy.Settings(
+            leaveAgentWindowsAlone: isLeavingAgentWindowsAlone,
+            neverTileBundleIdentifiers: neverTileBundleIdentifiers
+        )
+    }
+
+    @objc private func toggleLeaveAgentWindowsAlone() {
+        let enabled = !isLeavingAgentWindowsAlone
+        UserDefaults.standard.set(enabled, forKey: leaveAgentWindowsDefaultsKey)
+        leaveAgentWindowsItem.state = enabled ? .on : .off
+        Log.app.notice("Leave agent and debug windows alone \(enabled ? "on" : "off", privacy: .public)")
+        exclusionsChanged()
+    }
+
+    @objc private func neverTileSelected(_ sender: NSMenuItem) {
+        guard let identifier = sender.representedObject as? String else { return }
+        var identifiers = neverTileBundleIdentifiers
+        let adding = !identifiers.contains(identifier)
+        if adding { identifiers.insert(identifier) } else { identifiers.remove(identifier) }
+        UserDefaults.standard.set(identifiers.sorted(), forKey: neverTileDefaultsKey)
+        Log.app.notice("\(adding ? "Added" : "Removed", privacy: .public) \(identifier, privacy: .public) on the Never Tile list")
+        exclusionsChanged()
+    }
+
+    /// Either setting changes which windows count, so the usual window-change
+    /// check runs once: observers follow the new set, and the layout updates
+    /// only if the visible windows really differ.
+    private func exclusionsChanged() {
+        applyExclusionSettings()
+        eventMonitor?.refresh()
+        windowsMayHaveChanged(.windowSet)
+    }
+
+    /// The Never Tile submenu is rebuilt each time it opens: the apps showing
+    /// windows, and what is being left alone automatically, change constantly.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === neverTileMenu else { return }
+        menu.removeAllItems()
+        let overview = WindowExclusions.shared.overview()
+        let summary: String
+        if !isLeavingAgentWindowsAlone {
+            summary = "Automatic rule is turned off"
+        } else if overview.leftAlone.isEmpty {
+            summary = "No agent or debug windows open"
+        } else {
+            summary = "Leaving alone now: " + overview.leftAlone.joined(separator: ", ")
+        }
+        let summaryItem = NSMenuItem(title: summary, action: nil, keyEquivalent: "")
+        summaryItem.isEnabled = false
+        menu.addItem(summaryItem)
+        menu.addItem(.separator())
+        let saved = neverTileBundleIdentifiers
+        for choice in overview.choices {
+            let item = NSMenuItem(title: choice.name, action: #selector(neverTileSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = choice.bundleIdentifier
+            item.state = saved.contains(choice.bundleIdentifier) ? .on : .off
+            menu.addItem(item)
+        }
     }
 
     private var isAutoRetileEnabled: Bool {

@@ -26,7 +26,8 @@ swiftc -emit-library -emit-module -module-name WindowTilerCore Sources/WindowTil
     -emit-module-path "$task_dir/WindowTilerCore.swiftmodule" -o "$task_dir/libWindowTilerCore.dylib"
 cp Scripts/test-window-discovery.swift "$task_dir/main.swift"
 swiftc "$task_dir/WindowTiler.swift" Sources/WindowTilerApp/AppQuarantine.swift \
-    Sources/WindowTilerApp/EnhancedUIState.swift Sources/WindowTilerApp/Log.swift "$task_dir/main.swift" \
+    Sources/WindowTilerApp/EnhancedUIState.swift Sources/WindowTilerApp/Log.swift \
+    Sources/WindowTilerApp/WindowExclusions.swift Sources/WindowTilerApp/ProcessFacts.swift "$task_dir/main.swift" \
     -I "$task_dir" -L "$task_dir" -lWindowTilerCore -Xlinker -rpath -Xlinker "$task_dir" \
     -o "$task_dir/test-discovery"
 "$task_dir/test-discovery"

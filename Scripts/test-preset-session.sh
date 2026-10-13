@@ -23,6 +23,7 @@ swiftc -I "$build_root/Modules" \
   "$build_root/WindowTilerCore.build/PresetModels.swift.o" \
   "$build_root/WindowTilerCore.build/RowPlan.swift.o" \
   "$build_root/WindowTilerCore.build/TilingLimits.swift.o" \
+  "$build_root/WindowTilerCore.build/WindowExclusionPolicy.swift.o" \
   -o "$test_app/Contents/MacOS/test" -framework AppKit -framework Carbon
 codesign --force --sign - "$test_app" >/dev/null 2>&1
 "$test_app/Contents/MacOS/test" | tee "$test_root/result.txt"

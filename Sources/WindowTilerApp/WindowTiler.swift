@@ -87,6 +87,7 @@ final class WindowTiler {
     private var snapAllowances: [String: CGSize] = [:]
     private let quarantine = AppQuarantine.shared
     private let enhancedUI = EnhancedUIState.shared
+    private let exclusions: WindowExclusions
     private var visibleAppPIDs = Set<pid_t>()
     /// Unchanged sizes seen once after an accepted request, by window
     /// identity. A clamp is only believed when a later, separate tile shows
@@ -109,7 +110,8 @@ final class WindowTiler {
     /// the layout into the bounded-window mosaic.
     private let boundedTolerance: CGFloat = 32
 
-    init() {
+    init(exclusions: WindowExclusions = .shared) {
+        self.exclusions = exclusions
         AXUIElementSetMessagingTimeout(systemWideElement, messagingTimeout)
     }
 
@@ -730,12 +732,15 @@ final class WindowTiler {
         // Per-app state outlives hiding; only a quit app is forgotten.
         let alivePIDs = Set(alive.map(\.processIdentifier))
         quarantine.forget(except: alivePIDs)
+        exclusions.forget(except: alivePIDs)
         // Dynamic app properties can call LaunchServices synchronously. Check
         // the already-read window-server list before asking about each app.
+        // Excluded apps are checked last, so only visible apps cost system calls.
         let running = alive.filter {
             $0.processIdentifier != ownPID
                 && (onScreen[$0.processIdentifier] ?? []).contains { $0.bounds.width > 80 && $0.bounds.height > 80 }
                 && $0.activationPolicy == .regular && !$0.isTerminated && !$0.isHidden
+                && !exclusions.isExcluded(pid: $0.processIdentifier, bundleIdentifier: $0.bundleIdentifier)
         }
         visibleAppPIDs = Set(running.map(\.processIdentifier))
 
@@ -798,6 +803,9 @@ final class WindowTiler {
                   // Wispr exposes a large transparent status HUD as a window.
                   // Tiling it creates what looks like an empty desktop tile.
                   !(bundleIdentifier == "com.electron.wispr-flow" && title == "Status"),
+                  // Godot's editor opens a floating "(DEBUG)" window for a
+                  // game it runs; the editor itself is still tiled.
+                  !exclusions.isExcludedWindow(titled: title, bundleIdentifier: bundleIdentifier),
                   (attribute(kAXMinimizedAttribute, from: element) as? Bool) != true,
                   // A full-screen window lives on its own Space and is drawn
                   // on screen while that Space is active; it must be left alone.

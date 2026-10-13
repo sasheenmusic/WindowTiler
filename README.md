@@ -84,6 +84,19 @@ Presets remain saved after restarting Window Tiler, but a normal restart activat
 
 There is no hard window limit. If the display gets crowded, the app uses the closest layout that keeps every window visible.
 
+## Windows Window Tiler leaves alone
+
+Coding assistants and developer tools open test windows all day: a game run from an editor, an automated browser, a script's window. Tiling them would keep rearranging your real windows, so Window Tiler skips them.
+
+| Control | What it does |
+| --- | --- |
+| **Leave Agent and Debug Windows Alone** | On by default. Skips apps that another program started, such as a command run from Terminal or by an AI coding assistant, and the game window of a Godot debug run. |
+| **Never Tile** | Lists the apps showing windows now. Check an app to leave all of its windows alone; click it again to tile it. Checked apps that are not open stay in the list. |
+
+Apps you open from Finder, the Dock, Spotlight, or the `open` command are tiled as usual, so an app a script starts with `open -a` needs a checkmark in **Never Tile**. In Godot, the editor is still tiled; only the floating game window titled "… (DEBUG)" is left alone. The first line in the **Never Tile** submenu names what is being skipped right now, such as "Godot (debug run)", so a mistake is easy to spot.
+
+Windows that are left alone are never moved, resized, swapped by dragging, gathered from other desktops, or saved in a preset, and opening or closing them does not reflow your other windows. Changing either setting re-checks your layout once. **Never Tile** works even when the first setting is off.
+
 ## Build from source
 
 With the Xcode command-line tools installed:
@@ -133,9 +146,11 @@ python3 Scripts/test-public-signing-policy.py
 ./Scripts/test-sparkle-bundle.sh
 swiftc Sources/WindowTilerApp/HotKey.swift Scripts/test-hotkeys.swift -o /tmp/windowtiler-hotkey-tests
 /tmp/windowtiler-hotkey-tests
+swiftc Sources/WindowTilerApp/ProcessFacts.swift Scripts/test-process-facts.swift -o /tmp/windowtiler-process-facts-tests
+/tmp/windowtiler-process-facts-tests
 ```
 
-The session checks use in-memory settings and window stubs. The discovery checks simulate stale Accessibility handles, unresponsive apps, and temporary Electron flag cleanup; boundary checks cover capture filtering and shortcut recording through UI refreshes. The hotkey checks register temporary shortcuts and send events only within the test process. Neither moves your windows. Run these checks in a normal macOS login session.
+The session checks use in-memory settings and window stubs. The discovery checks simulate stale Accessibility handles, unresponsive apps, and temporary Electron flag cleanup; boundary checks cover capture filtering and shortcut recording through UI refreshes. The hotkey checks register temporary shortcuts and send events only within the test process. The process-facts checks read the parent, arguments, and responsible app of short-lived command-line children. They open no windows. None of these moves your windows. Run these checks in a normal macOS login session.
 
 The installer checks use offline downloads, fake signatures, and launch stubs in a temporary directory. They never replace your installed app.
 

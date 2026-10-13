@@ -11,7 +11,7 @@ struct TestApp {
     }
     let isTerminated = false
     let localizedName: String? = "Test app"
-    let bundleIdentifier: String? = "test.discovery"
+    var bundleIdentifier: String? = "test.discovery"
 }
 struct TestScreen { let frame = CGRect(x: 0, y: 0, width: 1600, height: 1000); var visibleFrame: CGRect { frame } }
 
@@ -36,14 +36,15 @@ enum TestOS {
     static func key(_ element: AXUIElement) -> UInt { UInt(bitPattern: Unmanaged.passUnretained(element).toOpaque()) }
     static func point(_ value: CGPoint) -> AXValue { var value = value; return AXValueCreate(.cgPoint, &value)! }
     static func size(_ value: CGSize) -> AXValue { var value = value; return AXValueCreate(.cgSize, &value)! }
-    static func window(_ pid: pid_t, id: CGWindowID, small: Bool) -> AXUIElement {
+    static var mainTitle = "Fixture"
+    static func window(_ pid: pid_t, id: CGWindowID, small: Bool, title: String = "Fixture") -> AXUIElement {
         let element = AXUIElementCreateApplication(pid)
         retained.append(element)
         nodes[key(element)] = Node(pid: pid, id: id, attributes: [
             kAXRoleAttribute: kAXWindowRole as NSString,
             kAXSubroleAttribute: (small ? kAXDialogSubrole : kAXStandardWindowSubrole) as NSString,
             kAXModalAttribute: NSNumber(value: false), kAXMinimizedAttribute: NSNumber(value: false),
-            "AXFullScreen": NSNumber(value: false), kAXTitleAttribute: "Fixture" as NSString,
+            "AXFullScreen": NSNumber(value: false), kAXTitleAttribute: title as NSString,
             kAXPositionAttribute: point(CGPoint(x: 0, y: 30)),
             kAXSizeAttribute: size(small ? CGSize(width: 66, height: 20) : CGSize(width: 800, height: 900))
         ])
@@ -54,7 +55,7 @@ enum TestOS {
         let element = AXUIElementCreateApplication(pid)
         retained.append(element)
         let children: [AXUIElement] = pid == mainPID
-            ? [window(pid, id: 9, small: true)] + (generation == 0 ? [] : [window(pid, id: 1, small: false)]) : []
+            ? [window(pid, id: 9, small: true)] + (generation == 0 ? [] : [window(pid, id: 1, small: false, title: mainTitle)]) : []
         nodes[key(element)] = Node(pid: pid, id: 0, attributes: [kAXWindowsAttribute: children as NSArray], fails: pid != mainPID)
         return element
     }
@@ -128,6 +129,62 @@ TestOS.shown.removeAll { $0 == TestOS.hungPID }
 check(tiler.windowCountsPerScreen() == [1], "moving quarantined app offscreen restores visible discovery")
 tiler.resetAccessibilityState()
 check(AppQuarantine.shared.pids.isEmpty, "permission recovery clears stale quarantine")
+
+// Windows Window Tiler leaves alone. Process facts are injected fakes (these
+// pids are not real processes); the filter is the production one.
+var parents: [pid_t: pid_t] = [:]
+var responsibles: [pid_t: pid_t] = [:]
+let exclusions = WindowExclusions(reader: ProcessFactsReader(
+    kernelInfo: { pid in parents[pid].map { ($0, .init(seconds: 1, microseconds: 0)) } },
+    readArguments: { _ in [] },
+    readResponsiblePID: { responsibles[$0] }
+))
+let guarded = WindowTiler(exclusions: exclusions)
+let mainSignature = "\(TestOS.mainPID)@"
+check(guarded.windowCountsPerScreen() == [1] && exclusions.settings.leaveAgentWindowsAlone,
+      "app with unknown process facts is tiled")
+parents[TestOS.mainPID] = 1; responsibles[TestOS.mainPID] = TestOS.mainPID
+check(guarded.windowCountsPerScreen() == [1], "app owned by launchd and responsible for itself is tiled")
+parents[TestOS.mainPID] = 4321
+let rootsBeforeExclusion = TestOS.roots[TestOS.mainPID] ?? 0
+check(guarded.windowCountsPerScreen() == [0] && guarded.windowTopologySignature()?.contains(mainSignature) == false
+      && guarded.windowTopologyAndCounts()?.counts == [0], "app started by another program is not counted or in the topology")
+check((TestOS.roots[TestOS.mainPID] ?? 0) == rootsBeforeExclusion, "excluded app receives no Accessibility discovery calls")
+exclusions.settings.leaveAgentWindowsAlone = false
+check(guarded.windowCountsPerScreen() == [1], "turning the toggle off tiles the app again")
+exclusions.settings.leaveAgentWindowsAlone = true
+parents[TestOS.mainPID] = 1; responsibles[TestOS.mainPID] = getpid()
+check(guarded.windowCountsPerScreen() == [0], "orphaned app with a live responsible app is not counted")
+responsibles[TestOS.mainPID] = 2_000_000
+check(guarded.windowCountsPerScreen() == [1], "app whose responsible process has exited is tiled")
+responsibles[TestOS.mainPID] = nil
+exclusions.settings.neverTileBundleIdentifiers = ["test.discovery"]
+check(guarded.windowCountsPerScreen() == [0], "app on the Never Tile list is not counted")
+exclusions.settings.leaveAgentWindowsAlone = false
+check(guarded.windowCountsPerScreen() == [0], "Never Tile list applies with the toggle off")
+exclusions.settings = .init()
+check(guarded.windowCountsPerScreen() == [1], "removing an app from the list tiles it again")
+
+parents[TestOS.hungPID] = 4321
+TestOS.shown.append(TestOS.hungPID)
+let hungReads = TestOS.reads[TestOS.hungPID] ?? 0
+check(guarded.windowTopologySignature() != nil && guarded.windowCountsPerScreen() == [1] && (TestOS.reads[TestOS.hungPID] ?? 0) == hungReads,
+      "excluded unresponsive app neither blocks discovery nor receives requests")
+TestOS.shown.removeAll { $0 == TestOS.hungPID }
+
+TestOS.runningApplications[0].bundleIdentifier = "org.godotengine.godot"
+TestOS.mainTitle = "Platformer (DEBUG)"
+check(guarded.windowCountsPerScreen() == [0], "Godot editor's floating (DEBUG) game window is not counted")
+TestOS.mainTitle = "Platformer - Godot Engine"
+check(guarded.windowCountsPerScreen() == [1], "Godot editor's own window is still tiled")
+TestOS.mainTitle = "Platformer (DEBUG)"
+exclusions.settings.leaveAgentWindowsAlone = false
+check(guarded.windowCountsPerScreen() == [1], "(DEBUG) window is tiled when the toggle is off")
+exclusions.settings = .init()
+TestOS.runningApplications[0].bundleIdentifier = "test.discovery"
+check(guarded.windowCountsPerScreen() == [1], "(DEBUG) title only matters for Godot")
+TestOS.mainTitle = "Fixture"
+parents = [:]; responsibles = [:]
 print("RESULT \(assertions) discovery assertions passed")
 
 // Shared flag cleanup lifecycle; every app/read/write is an injected fake.

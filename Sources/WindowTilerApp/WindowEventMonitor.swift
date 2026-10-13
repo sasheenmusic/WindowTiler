@@ -8,6 +8,7 @@ final class WindowEventMonitor {
     enum Change { case windowSet, geometry }
     private var observers: [pid_t: AXObserver] = [:]
     private let quarantine = AppQuarantine.shared
+    private let exclusions = WindowExclusions.shared
     private let messagingTimeout: Float = 1.0
     private var workspaceTokens: [NSObjectProtocol] = []
     private let onChange: (Change) -> Void
@@ -75,12 +76,16 @@ final class WindowEventMonitor {
     }
 
     /// Attaches to newly launched apps and forgets apps that have quit. Safe
-    /// to call often; apps already observed are left alone.
+    /// to call often; apps already observed are left alone. Apps that are
+    /// left alone get no observer, so their windows cost nothing; one that
+    /// becomes excluded (or stops being) is detached (or attached) here, so
+    /// a changed setting only needs a refresh.
     func refresh() {
         guard AXIsProcessTrusted() else { return }
         let ownPID = ProcessInfo.processInfo.processIdentifier
         let apps = NSWorkspace.shared.runningApplications.filter {
             $0.activationPolicy == .regular && !$0.isTerminated && $0.processIdentifier != ownPID
+                && !exclusions.isExcluded(pid: $0.processIdentifier, bundleIdentifier: $0.bundleIdentifier)
         }
         let livePIDs = Set(apps.map(\.processIdentifier))
         for (pid, observer) in observers where !livePIDs.contains(pid) {
