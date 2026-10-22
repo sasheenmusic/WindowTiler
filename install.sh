@@ -14,6 +14,7 @@ os_version=$(sw_vers -productVersion)
 
 app_name='Window Tiler.app'
 bundle_id='com.windowtiler.app'
+team_id='B697BHH54U'
 valid_version() { [[ $1 =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]]; }
 normalize_os_version() {
     local version=$1
@@ -54,7 +55,7 @@ validate_app() {
         [[ $parent == "$physical" || $parent == "$physical/"* ]] || return 1
         [[ -e $link ]] || return 1
     done < <(find "$app" -type l -print0)
-    codesign --verify --deep --strict "$app" >/dev/null 2>&1
+    codesign --verify --deep --strict -R="anchor apple generic and certificate leaf[subject.OU] = \"$team_id\"" "$app" >/dev/null 2>&1
 }
 
 # Prefer the existing copy, even when another install directory is writable.

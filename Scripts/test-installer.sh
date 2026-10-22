@@ -31,8 +31,9 @@ esac
 MOCK
 cat > "$test_root/bin/codesign" <<'MOCK'
 #!/bin/bash
-for app in "$@"; do :; done
-[[ -f "$app/Contents/signature-fixture" && ! -f "$app/Contents/invalid-signature" ]]
+team=false
+for app in "$@"; do [[ $app == *'leaf[subject.OU] = "B697BHH54U"'* ]] && team=true; done
+[[ $team == true && -f "$app/Contents/signature-fixture" && ! -f "$app/Contents/invalid-signature" ]]
 MOCK
 cat > "$test_root/bin/open" <<'MOCK'
 #!/bin/bash
