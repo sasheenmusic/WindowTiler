@@ -75,6 +75,9 @@ final class WindowTiler {
     /// The most windows the automatic layout puts in one row. Set from the
     /// menu; the hand-picked row path ignores it by design.
     var windowsPerRow = TilingLimits.defaultWindowsPerRow
+    /// Points between windows and along the screen edges. Set from the
+    /// menu; applies to both the automatic and the hand-picked layout.
+    var gap = CGFloat(WindowGap.defaultGap)
     /// A window's real limits can change (a toggled sidebar, a different
     /// System Settings pane). Learned limits older than this are measured
     /// again on the next tile, so stale values cannot stick around.
@@ -206,7 +209,8 @@ final class WindowTiler {
     /// in it, and the next automatic tile measures everything again.
     private func tileRows(windows unordered: [Window], plan: RowPlan, in screen: CGRect, summaries: inout [String]) -> TilingResult {
         let windows = readingOrder(unordered)
-        let frames = LayoutEngine.frames(rowCounts: plan.rows, in: screen)
+        let frames = LayoutEngine.frames(rowCounts: plan.rows, in: WindowGap.layoutBounds(screen, gap: gap))
+            .map { WindowGap.windowFrame(in: $0, gap: gap) }
         guard frames.count == windows.count else { return .empty }
         for (index, window) in windows.enumerated() { slots[window.identity] = frames[index] }
         var observed = windows.map { CGRect(origin: $0.currentPosition, size: $0.currentSize) }
@@ -261,12 +265,14 @@ final class WindowTiler {
         guard !unordered.isEmpty else { return .empty }
         let tileStartedAt = Date()
         let windows = readingOrder(unordered)
+        // The largest a window can be once the gap surrounds it.
+        let windowArea = screen.insetBy(dx: gap, dy: gap)
 
         var limits = windows.map { window -> SizeLimits in
             guard window.sizeIsSettable else {
                 return SizeLimits(minimum: window.currentSize, maximum: window.currentSize)
             }
-            return effectiveLimits(learnedLimits[window.identity] ?? LearnedLimits(), on: screen)
+            return effectiveLimits(learnedLimits[window.identity] ?? LearnedLimits(), on: windowArea)
         }
         var bounded = Set(windows.indices.filter { !windows[$0].sizeIsSettable })
         var boundedIndices: [Int] = []
@@ -337,7 +343,7 @@ final class WindowTiler {
                 if learned.minimum != previous.minimum || learned.maximum != previous.maximum {
                     learned.learnedAt = Date()
                     learnedLimits[windows[index].identity] = learned
-                    limits[index] = effectiveLimits(learned, on: screen)
+                    limits[index] = effectiveLimits(learned, on: windowArea)
                     learnedOnLastPass = true
                 }
             }
@@ -448,17 +454,28 @@ final class WindowTiler {
         var boundedIndices: [Int] = []
         var flexibleIndices: [Int] = []
         var layout = MosaicLayout(constrainedFrames: [], flexibleFrames: [])
+        // The engines lay out padded cells; each window is then inset in its
+        // cell, which leaves the gap around it.
+        let cellBounds = WindowGap.layoutBounds(screen, gap: gap)
+        func cell(_ size: CGSize) -> CGSize {
+            let padded = WindowGap.cellSize(for: size, gap: gap)
+            return CGSize(width: min(padded.width, cellBounds.width), height: min(padded.height, cellBounds.height))
+        }
 
         for _ in 0...windows.count {
             boundedIndices = windows.indices.filter { bounded.contains($0) }
             flexibleIndices = windows.indices.filter { !bounded.contains($0) }
-            layout = MosaicLayoutEngine.frames(
+            let cells = MosaicLayoutEngine.frames(
                 constrainedSizes: boundedIndices.map {
-                    windows[$0].sizeIsSettable ? limits[$0].maximum : windows[$0].currentSize
+                    cell(windows[$0].sizeIsSettable ? limits[$0].maximum : windows[$0].currentSize)
                 },
-                flexibleMinimumSizes: flexibleIndices.map { limits[$0].minimum },
-                in: screen,
+                flexibleMinimumSizes: flexibleIndices.map { cell(limits[$0].minimum) },
+                in: cellBounds,
                 windowsPerRow: windowsPerRow
+            )
+            layout = MosaicLayout(
+                constrainedFrames: cells.constrainedFrames.map { WindowGap.windowFrame(in: $0, gap: gap) },
+                flexibleFrames: cells.flexibleFrames.map { WindowGap.windowFrame(in: $0, gap: gap) }
             )
             let newlyBounded = flexibleIndices.enumerated().compactMap { position, index -> Int? in
                 guard position < layout.flexibleFrames.count else { return index }

@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var eventMonitor: WindowEventMonitor?
     private var shortcutItems: [NSMenuItem] = []
     private var windowsPerRowItems: [NSMenuItem] = []
+    private var gapItems: [NSMenuItem] = []
     private var autoRetileItem: NSMenuItem!
     private var swapByDraggingItem: NSMenuItem!
     private var leaveAgentWindowsItem: NSMenuItem!
@@ -50,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let shortcutDefaultsKey = "shortcutIndex"
     private let autoRetileDefaultsKey = "autoRetile"
     private let windowsPerRowDefaultsKey = "windowsPerRow"
+    private let gapDefaultsKey = "windowGap"
     private let swapByDraggingDefaultsKey = "swapByDragging"
     private let leaveAgentWindowsDefaultsKey = "leaveAgentWindowsAlone"
     private let neverTileDefaultsKey = "neverTileBundleIdentifiers"
@@ -76,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         selectShortcut(index: savedShortcutIndex(), interactive: false)
         selectWindowsPerRow(savedWindowsPerRow(), interactive: false)
+        selectGap(savedGap(), interactive: false)
         registerPresetShortcuts()
 
         let accessibilityEnabled = tiler.isAccessibilityEnabled(prompt: false)
@@ -175,6 +178,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
+        let gapHeading = NSMenuItem(title: "Gap Between Windows", action: nil, keyEquivalent: "")
+        gapHeading.isEnabled = false
+        menu.addItem(gapHeading)
+        gapItems = WindowGap.choices.map { points in
+            let item = NSMenuItem(title: points == 0 ? "None" : "\(points)", action: #selector(gapSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = points
+            menu.addItem(item)
+            return item
+        }
+        menu.addItem(.separator())
+
         let heading = NSMenuItem(title: "Keyboard Shortcut", action: nil, keyEquivalent: "")
         heading.isEnabled = false
         menu.addItem(heading)
@@ -231,6 +246,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             chooseAutomaticLayout()
         } else if isAutoRetileEnabled {
             performTile(showFeedback: false, relearn: false, reason: "windows per row set to \(count)")
+        }
+    }
+
+    private func savedGap() -> Int {
+        let stored = UserDefaults.standard.integer(forKey: gapDefaultsKey)
+        return WindowGap.choices.contains(stored) ? stored : WindowGap.defaultGap
+    }
+
+    @objc private func gapSelected(_ sender: NSMenuItem) {
+        selectGap(sender.tag, interactive: true)
+    }
+
+    /// - Parameter interactive: the user just picked this, so the windows
+    ///   should show it now. Unlike windows per row, a hand-picked layout
+    ///   keeps its rows; only the spacing changes.
+    private func selectGap(_ points: Int, interactive: Bool) {
+        guard WindowGap.choices.contains(points) else { return }
+        UserDefaults.standard.set(points, forKey: gapDefaultsKey)
+        tiler.gap = CGFloat(points)
+        gapItems.forEach { $0.state = $0.tag == points ? .on : .off }
+        guard interactive else { return }
+        Log.app.notice("Window gap set to \(points)")
+        if activePresetID != nil { return }
+        if handPickedPlan != nil || isAutoRetileEnabled {
+            performTile(showFeedback: false, relearn: false, reason: "window gap set to \(points)")
         }
     }
 
@@ -748,6 +788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         shortcutItems.enumerated().forEach { $0.element.state = $0.offset == savedShortcutIndex() && hotKeyManager.currentChoice != nil ? .on : .off }
         windowsPerRowItems.forEach { $0.state = $0.tag == savedWindowsPerRow() ? .on : .off }
+        gapItems.forEach { $0.state = $0.tag == savedGap() ? .on : .off }
         dragSwap?.isEnabled = isSwapByDraggingEnabled && activePresetID == nil
         presetPanel.refresh(presets: presets, activeID: activePresetID)
     }
