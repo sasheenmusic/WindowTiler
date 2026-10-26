@@ -43,7 +43,7 @@ Automatic tiling is on by default. Windows reflow when they open, close, minimiz
 | **Windows Per Row** | Set the automatic layout to use up to 2, 3, 4, or 5 windows per row. |
 | **Choose Layout…** | Pick the number of windows in each row using a five-by-five grid. |
 | **Swap Windows by Dragging** | Drag one window onto another to trade their places. |
-| **Gap Between Windows** | Leave None, 4, 8, 12, 16, or 24 points of space between windows and along the screen edges, so your desktop background shows through. None is the default. |
+| **Gap Between Windows** | Leave None, 8, 16, 32, 64, or 128 points of space between windows and along the screen edges, so your desktop background shows through. None is the default. |
 
 In **Choose Layout…**, each grid row is a band of the screen, from top to bottom. To put four windows above one window, click the fourth square in row 1 and the first square in row 2. **Apply** becomes available when your choices add up to the number of open windows on that display. Click a selected square again to clear its row.
 

@@ -7,7 +7,7 @@ import CoreGraphics
 /// cell. Neighbors end up a full gap apart, and so do windows and the edges.
 public enum WindowGap {
     /// Points. Even values keep every half-gap on a whole pixel.
-    public static let choices = [0, 4, 8, 12, 16, 24]
+    public static let choices = [0, 8, 16, 32, 64, 128]
     public static let defaultGap = 0
 
     /// The area the padded cells fill.
