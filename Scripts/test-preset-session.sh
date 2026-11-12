@@ -2,7 +2,6 @@
 set -euo pipefail
 project_root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$project_root"
-swift build --disable-sandbox >/dev/null
 test_root=$(mktemp -d /tmp/windowtiler-session-tests.XXXXXX)
 test_app="$test_root/PresetSessionTests.app"
 mkdir -p "$test_app/Contents/MacOS"
@@ -16,14 +15,15 @@ cat > "$test_app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleVersion</key><string>3</string>
 </dict></plist>
 PLIST
-build_root=$(swift build --disable-sandbox --show-bin-path)
-swiftc -I "$build_root/Modules" \
+core_dir="$test_root/core"
+mkdir -p "$core_dir"
+# Build WindowTilerCore here rather than reading SwiftPM's build folder, whose layout differs between Swift versions.
+swiftc -parse-as-library -module-name WindowTilerCore -emit-library -static \
+  -emit-module -emit-module-path "$core_dir/WindowTilerCore.swiftmodule" \
+  -o "$core_dir/libWindowTilerCore.a" Sources/WindowTilerCore/*.swift
+swiftc -I "$core_dir" -L "$core_dir" -lWindowTilerCore \
   Sources/WindowTilerApp/AppDelegate.swift Sources/WindowTilerApp/HotKey.swift Sources/WindowTilerApp/Log.swift \
   Scripts/test-preset-session.swift \
-  "$build_root/WindowTilerCore.build/PresetModels.swift.o" \
-  "$build_root/WindowTilerCore.build/RowPlan.swift.o" \
-  "$build_root/WindowTilerCore.build/TilingLimits.swift.o" \
-  "$build_root/WindowTilerCore.build/WindowExclusionPolicy.swift.o" \
   -o "$test_app/Contents/MacOS/test" -framework AppKit -framework Carbon
 codesign --force --sign - "$test_app" >/dev/null 2>&1
 "$test_app/Contents/MacOS/test" | tee "$test_root/result.txt"

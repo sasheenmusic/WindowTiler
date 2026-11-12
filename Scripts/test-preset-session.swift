@@ -75,6 +75,7 @@ final class WindowTiler {
     static var latest: WindowTiler!
     static var initialAccessibilityEnabled = true
     var windowsPerRow = 2
+    var gap: CGFloat = 0
     var accessibilityEnabled: Bool
     var resetCount = 0
     var systemPromptCount = 0

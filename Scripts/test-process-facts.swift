@@ -87,6 +87,14 @@ enum ProcessFactsTests {
         print("PASS: own process facts match what the system reports")
     }
 
+    /// Started from Terminal, ssh, or an app, this test and its children share a
+    /// responsible process. Started detached (nohup, launchd), macOS makes each
+    /// process responsible for itself, so there is nothing to compare against.
+    static func runsUnderResponsibleProcess(_ own: ProcessFactsReader.Facts?) -> Bool {
+        guard let responsible = own?.responsiblePID else { return true }
+        return responsible != getpid()
+    }
+
     static func checkChild(_ reader: ProcessFactsReader, own: ProcessFactsReader.Facts?) throws {
         let flags = ["--remote-debug", "tcp://127.0.0.1:6007"]
         let child = sleepingPerl(arguments: flags)
@@ -97,6 +105,12 @@ enum ProcessFactsTests {
         try require(facts.arguments == ["/usr/bin/perl", "-e", "sleep 30", "--"] + flags, "The child's arguments were misread: \(facts.arguments)")
         guard let responsible = facts.responsiblePID else {
             throw Failure(description: "The responsible process is unavailable; the private lookup may have changed.")
+        }
+        guard runsUnderResponsibleProcess(own) else {
+            try require(reader.facts(for: child.processIdentifier) == facts, "A second read of the child changed its facts.")
+            print("SKIP: responsible-process checks: this run has no responsible app (started detached), so macOS makes every process responsible for itself. Run from Terminal or ssh to cover them.")
+            print("PASS: a command-line child reports its parent and exact arguments")
+            return
         }
         try require(responsible != child.processIdentifier, "The child was reported responsible for itself.")
         try require(responsible == own?.responsiblePID, "The child's responsible process differs from its parent's.")
@@ -130,6 +144,10 @@ enum ProcessFactsTests {
         try wait(for: "the orphan to reach launchd") { reader.facts(for: orphan)?.parentPID == 1 }
         guard let facts = reader.facts(for: orphan) else { throw Failure(description: "The orphan has no facts.") }
         try require(facts.arguments.suffix(2) == ["--editor-pid", "1"], "The orphan's arguments were misread: \(facts.arguments)")
+        guard runsUnderResponsibleProcess(own) else {
+            print("PASS: an orphaned process reaches launchd with its arguments (responsible-process check skipped, see above)")
+            return
+        }
         try require(facts.responsiblePID != nil && facts.responsiblePID == own?.responsiblePID,
                     "The orphan lost its responsible process: \(String(describing: facts.responsiblePID)).")
         try require(facts.responsibleIsAlive, "The orphan's running responsible process was reported gone.")
